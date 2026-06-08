@@ -2,6 +2,8 @@ import express, { type Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
+import { WebSocketServer } from "ws";
+import { initCopilotBridge } from "./copilot-bridge";
 
 const app = express();
 const httpServer = createServer(app);
@@ -61,6 +63,19 @@ app.use((req, res, next) => {
 
 (async () => {
   await registerRoutes(httpServer, app);
+
+  // Copilot LSP — WebSocket bridge at /ws/copilot-lsp
+  const copilotWss = new WebSocketServer({ noServer: true });
+  httpServer.on("upgrade", (req, socket, head) => {
+    if (req.url === "/ws/copilot-lsp") {
+      copilotWss.handleUpgrade(req, socket as any, head, (ws) => {
+        copilotWss.emit("connection", ws, req);
+      });
+    } else {
+      socket.destroy();
+    }
+  });
+  initCopilotBridge(copilotWss);
 
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     const status = err.status || err.statusCode || 500;

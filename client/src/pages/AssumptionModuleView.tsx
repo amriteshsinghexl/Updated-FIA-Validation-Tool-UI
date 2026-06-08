@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { Card } from "@/components/ui/card";
-import { Plus, Minus, ChevronDown, ChevronRight } from "lucide-react";
+import { Plus, Minus } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const STAT_DATA = [

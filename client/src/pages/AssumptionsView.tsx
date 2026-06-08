@@ -1,185 +1,311 @@
-import React from "react";
-import { useLocation } from "wouter";
+import React, { useState, useRef } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { BarChart3, TrendingUp, ShieldAlert, Layers, Upload, FileType, CheckCircle2, AlertCircle } from "lucide-react";
+import { Upload, Trash2, FileSpreadsheet, FileText, RefreshCw } from "lucide-react";
+import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 
-const FileRow = ({ 
-  label, 
-  systemName, 
-  status 
-}: { 
-  label: string, 
-  systemName?: string, 
-  status: "ok" | "error" | "pending" 
-}) => (
-  <div className="grid grid-cols-12 gap-4 items-center py-4 border-b border-border last:border-0 hover:bg-gray-50/50 px-4 transition-colors">
-    <div className="col-span-4">
-      <div className="font-medium text-sm text-gray-900">{label}</div>
-    </div>
-    <div className="col-span-2">
-      <select className="w-full h-8 text-xs border border-gray-300 rounded bg-white px-2">
-        <option>Yes</option>
-        <option>No</option>
-      </select>
-    </div>
-    <div className="col-span-4">
-      {systemName && (
-        <div className="flex items-center gap-2 overflow-hidden">
-          <FileType className="h-4 w-4 text-blue-500 flex-shrink-0" />
-          <div className="text-sm font-mono text-gray-700 truncate">{systemName}</div>
-        </div>
-      )}
-    </div>
-    <div className="col-span-2 flex justify-end">
-      {status === "ok" && <CheckCircle2 className="h-5 w-5 text-green-500" />}
-      {status === "error" && <AlertCircle className="h-5 w-5 text-red-500" />}
-      {status === "pending" && <div className="h-2 w-2 rounded-full bg-gray-300" />}
-    </div>
-  </div>
-);
+interface FileInfo {
+  name: string;
+  size: number;
+  modified: string;
+}
 
-const DropZone = ({ label, active = false }: { label: string, active?: boolean }) => (
-  <div className={cn(
-    "h-32 border-2 border-dashed rounded-lg flex flex-col items-center justify-center p-4 text-center transition-colors cursor-pointer group",
-    active ? "border-blue-500 bg-blue-50/50" : "border-gray-300 hover:border-blue-400 hover:bg-gray-50"
-  )}>
-    <div className={cn(
-      "h-8 w-8 rounded-full flex items-center justify-center mb-2 transition-colors",
-      active ? "bg-blue-100 text-blue-600" : "bg-gray-100 text-gray-400 group-hover:bg-blue-50 group-hover:text-blue-500"
-    )}>
-      <Upload className="h-4 w-4" />
-    </div>
-    <p className="text-xs font-medium text-gray-900">{label}</p>
-    <p className="text-[10px] text-muted-foreground mt-0.5">Drag and drop files here</p>
-  </div>
+interface CsvData {
+  filename: string;
+  type: "csv";
+  headers: string[];
+  rows: string[][];
+}
+
+interface TextData {
+  filename: string;
+  type: "text";
+  content: string;
+}
+
+type FileData = CsvData | TextData;
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const CsvTable = ({ data }: { data: CsvData }) => (
+  <table className="text-xs border-collapse min-w-full">
+    <thead className="sticky top-0 z-10">
+      <tr className="bg-slate-900 text-white">
+        <th className="border border-slate-700 px-3 py-1.5 text-center font-medium w-10 text-slate-400 select-none">
+          #
+        </th>
+        {data.headers.map((h, i) => (
+          <th
+            key={i}
+            className="border border-slate-700 px-3 py-1.5 text-left font-semibold whitespace-nowrap"
+          >
+            {h || `Col${i + 1}`}
+          </th>
+        ))}
+      </tr>
+    </thead>
+    <tbody>
+      {data.rows.map((row, ri) => (
+        <tr
+          key={ri}
+          className={cn(
+            "hover:bg-blue-50/60 transition-colors",
+            ri % 2 === 0 ? "bg-white" : "bg-slate-50/60"
+          )}
+        >
+          <td className="border border-slate-200 px-3 py-1 text-center text-slate-400 bg-slate-50 font-mono select-none">
+            {ri + 1}
+          </td>
+          {data.headers.map((_, ci) => (
+            <td
+              key={ci}
+              className="border border-slate-200 px-3 py-1 font-mono whitespace-nowrap"
+            >
+              {row[ci] ?? ""}
+            </td>
+          ))}
+        </tr>
+      ))}
+    </tbody>
+  </table>
 );
 
 const AssumptionsView = () => {
-  const [location, setLocation] = useLocation();
-  const liabilityAssumptions = [
-    { parameter: "Mortality Rate", value: "2024 VBT Table", source: "Liability Input", category: "Demographic" },
-    { parameter: "Lapse Rate", value: "Dynamic - 5% Base", source: "Liability Input", category: "Behavioral" },
-    { parameter: "Expense Load", value: "1.2% of AUM", source: "Liability Input", category: "Financial" },
-  ];
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const replaceInputRef = useRef<HTMLInputElement>(null);
+  const { toast } = useToast();
+  const queryClient = useQueryClient();
 
-  const assetAssumptions = [
-    { parameter: "Reinvestment Yield", value: "4.5% Fixed Income", source: "Asset Input", category: "Yield" },
-    { parameter: "Default Risk", value: "12bps per annum", source: "Asset Input", category: "Credit" },
-    { parameter: "Spread Curve", value: "UST + 150bps", source: "Asset Input", category: "Market" },
-  ];
+  const { data: filesData, isLoading: filesLoading } = useQuery<{ files: FileInfo[] }>({
+    queryKey: ["/api/assumptions/files"],
+    queryFn: async () => {
+      const res = await fetch("/api/assumptions/files");
+      if (!res.ok) throw new Error("Failed to fetch files");
+      return res.json();
+    },
+  });
+
+  const { data: fileData, isLoading: fileLoading } = useQuery<FileData>({
+    queryKey: ["/api/assumptions/files", selectedFile],
+    queryFn: async () => {
+      const res = await fetch(`/api/assumptions/files/${encodeURIComponent(selectedFile!)}`);
+      if (!res.ok) throw new Error("Failed to fetch file");
+      return res.json();
+    },
+    enabled: !!selectedFile,
+  });
+
+  const uploadMutation = useMutation({
+    mutationFn: async ({ filename, content }: { filename: string; content: string }) => {
+      const res = await fetch("/api/assumptions/files", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename, content }),
+      });
+      if (!res.ok) throw new Error("Upload failed");
+      return res.json();
+    },
+    onSuccess: (_data, { filename }) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/assumptions/files"] });
+      queryClient.invalidateQueries({ queryKey: ["/api/assumptions/files", filename] });
+      setSelectedFile(filename);
+      toast({ title: "File uploaded successfully" });
+    },
+    onError: () => toast({ title: "Upload failed", variant: "destructive" }),
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async (filename: string) => {
+      const res = await fetch(`/api/assumptions/files/${encodeURIComponent(filename)}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error("Delete failed");
+      return res.json();
+    },
+    onSuccess: (_data, filename) => {
+      queryClient.invalidateQueries({ queryKey: ["/api/assumptions/files"] });
+      if (selectedFile === filename) setSelectedFile(null);
+      toast({ title: "File deleted" });
+    },
+    onError: () => toast({ title: "Delete failed", variant: "destructive" }),
+  });
+
+  const readAndUpload = (file: File, overrideName?: string) => {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const content = ev.target?.result as string;
+      uploadMutation.mutate({ filename: overrideName ?? file.name, content });
+    };
+    reader.readAsText(file);
+  };
+
+  const handleUploadNew = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) readAndUpload(file);
+    e.target.value = "";
+  };
+
+  const handleReplace = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file && selectedFile) readAndUpload(file, selectedFile);
+    e.target.value = "";
+  };
+
+  const handleDelete = (filename: string) => {
+    if (window.confirm(`Delete "${filename}"? This cannot be undone.`)) {
+      deleteMutation.mutate(filename);
+    }
+  };
+
+  const files = filesData?.files ?? [];
 
   return (
-    <div className="p-6 space-y-6">
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold tracking-tight">Model Assumptions</h1>
-        <Button 
-          variant="outline" 
-          size="sm" 
-          onClick={() => setLocation("/assumption-module")}
-          className="gap-2 bg-amber-50 text-amber-700 border-amber-200 hover:bg-amber-100 shadow-sm font-bold"
-        >
-          <Layers className="h-4 w-4" /> Assumption Module Macro
-        </Button>
+    <div className="flex h-[calc(100vh-6rem)] overflow-hidden">
+      {/* Left panel – file list */}
+      <div className="w-60 flex-shrink-0 border-r border-border bg-slate-50 flex flex-col">
+        <div className="p-3 border-b border-border bg-white space-y-2">
+          <p className="text-[10px] font-bold uppercase text-slate-500 tracking-wider">
+            Parameter Tables
+          </p>
+          <input
+            ref={uploadInputRef}
+            type="file"
+            className="hidden"
+            accept=".csv,.yaml,.yml,.txt"
+            onChange={handleUploadNew}
+          />
+          <Button
+            size="sm"
+            className="w-full h-7 text-xs gap-1.5 bg-blue-600 hover:bg-blue-700"
+            onClick={() => uploadInputRef.current?.click()}
+            disabled={uploadMutation.isPending}
+          >
+            <Upload className="h-3.5 w-3.5" />
+            Upload New File
+          </Button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto">
+          {filesLoading ? (
+            <div className="flex items-center gap-2 p-4 text-xs text-slate-400">
+              <RefreshCw className="h-3.5 w-3.5 animate-spin" /> Loading…
+            </div>
+          ) : files.length === 0 ? (
+            <div className="p-4 text-xs text-slate-400 italic">No files found</div>
+          ) : (
+            files.map((file) => (
+              <div
+                key={file.name}
+                className={cn(
+                  "group flex items-center justify-between px-3 py-2 cursor-pointer border-b border-slate-100 hover:bg-slate-100 transition-colors",
+                  selectedFile === file.name &&
+                    "bg-blue-50 border-l-2 border-l-blue-500"
+                )}
+                onClick={() => setSelectedFile(file.name)}
+              >
+                <div className="flex items-center gap-1.5 min-w-0">
+                  {file.name.endsWith(".csv") ? (
+                    <FileSpreadsheet className="h-3.5 w-3.5 text-green-600 flex-shrink-0" />
+                  ) : (
+                    <FileText className="h-3.5 w-3.5 text-blue-500 flex-shrink-0" />
+                  )}
+                  <div className="min-w-0">
+                    <p className="text-xs text-slate-800 truncate">{file.name}</p>
+                    <p className="text-[10px] text-slate-400">{formatSize(file.size)}</p>
+                  </div>
+                </div>
+                <button
+                  className="flex-shrink-0 opacity-0 group-hover:opacity-100 text-red-400 hover:text-red-600 transition-opacity p-0.5 ml-1"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleDelete(file.name);
+                  }}
+                  title="Delete"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            ))
+          )}
+        </div>
       </div>
 
-      {/* Drag and Drop Section */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="space-y-4">
-          <DropZone label="Liability input files" active />
-          <Card className="shadow-sm border-border bg-white overflow-hidden">
-            <div className="bg-gray-50/50 px-4 py-2 border-b border-border">
-              <h3 className="text-xs font-bold uppercase text-gray-500">Liability Mapping</h3>
+      {/* Right panel – file content */}
+      <div className="flex-1 flex flex-col overflow-hidden bg-white">
+        {!selectedFile ? (
+          <div className="flex-1 flex flex-col items-center justify-center text-slate-400 gap-2">
+            <FileSpreadsheet className="h-10 w-10 opacity-30" />
+            <p className="text-sm">Select a file to view its contents</p>
+          </div>
+        ) : (
+          <>
+            {/* Header bar */}
+            <div className="flex items-center justify-between px-4 py-2 border-b border-border flex-shrink-0 bg-slate-50">
+              <div className="flex items-center gap-2">
+                {selectedFile.endsWith(".csv") ? (
+                  <FileSpreadsheet className="h-4 w-4 text-green-600" />
+                ) : (
+                  <FileText className="h-4 w-4 text-blue-500" />
+                )}
+                <span className="text-sm font-semibold text-slate-800">{selectedFile}</span>
+                {fileData?.type === "csv" && (
+                  <span className="text-[10px] text-slate-400 ml-1">
+                    {fileData.rows.length} rows × {fileData.headers.length} cols
+                  </span>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  ref={replaceInputRef}
+                  type="file"
+                  className="hidden"
+                  accept=".csv,.yaml,.yml,.txt"
+                  onChange={handleReplace}
+                />
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs gap-1.5"
+                  onClick={() => replaceInputRef.current?.click()}
+                  disabled={uploadMutation.isPending}
+                >
+                  <Upload className="h-3 w-3" /> Replace
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs gap-1.5 text-red-600 hover:text-red-700 border-red-200 hover:bg-red-50"
+                  onClick={() => handleDelete(selectedFile)}
+                  disabled={deleteMutation.isPending}
+                >
+                  <Trash2 className="h-3 w-3" /> Delete
+                </Button>
+              </div>
             </div>
-            <div className="divide-y divide-border">
-              <FileRow label="Base Mortality (NY)" systemName="2025_BaseMort_NY" status="ok" />
+
+            {/* Content */}
+            <div className="flex-1 overflow-auto">
+              {fileLoading ? (
+                <div className="flex items-center justify-center h-full gap-2 text-slate-400 text-sm">
+                  <RefreshCw className="h-4 w-4 animate-spin" /> Loading…
+                </div>
+              ) : fileData?.type === "csv" ? (
+                <CsvTable data={fileData} />
+              ) : fileData?.type === "text" ? (
+                <pre className="p-4 text-xs font-mono text-slate-700 whitespace-pre-wrap leading-relaxed">
+                  {fileData.content}
+                </pre>
+              ) : null}
             </div>
-          </Card>
-        </div>
-        <div className="space-y-4">
-          <DropZone label="Asset input files" />
-          <Card className="shadow-sm border-border bg-white overflow-hidden">
-            <div className="bg-gray-50/50 px-4 py-2 border-b border-border">
-              <h3 className="text-xs font-bold uppercase text-gray-500">Asset Mapping</h3>
-            </div>
-            <div className="divide-y divide-border">
-              <FileRow label="Yield Curve Scenarios" systemName="12M25_YC_50scenario" status="ok" />
-            </div>
-          </Card>
-        </div>
+          </>
+        )}
       </div>
-
-      <Tabs defaultValue="liability" className="w-full">
-        <TabsList className="grid w-full max-w-md grid-cols-2">
-          <TabsTrigger value="liability">Liability Assumptions</TabsTrigger>
-          <TabsTrigger value="asset">Asset Assumptions</TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="liability" className="mt-6">
-          <Card>
-            <CardHeader className="flex flex-row items-center gap-2">
-              <ShieldAlert className="h-5 w-5 text-blue-600" />
-              <CardTitle>Liability Side Parameters</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <Table>
-                <TableHeader className="bg-slate-900">
-                  <TableRow>
-                    <TableHead className="text-white">Parameter</TableHead>
-                    <TableHead className="text-white">Value/Basis</TableHead>
-                    <TableHead className="text-white">Category</TableHead>
-                    <TableHead className="text-white">Source File</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {liabilityAssumptions.map((item) => (
-                    <TableRow key={item.parameter} className="hover:bg-slate-50">
-                      <TableCell className="font-medium">{item.parameter}</TableCell>
-                      <TableCell>{item.value}</TableCell>
-                      <TableCell>{item.category}</TableCell>
-                      <TableCell className="text-muted-foreground text-sm">{item.source}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
-        </TabsContent>
-
-        <TabsContent value="asset" className="mt-6">
-          <Card>
-            <CardHeader className="flex flex-row items-center gap-2">
-              <TrendingUp className="h-5 w-5 text-green-600" />
-              <CardTitle>Asset Side Parameters</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <Table>
-                <TableHeader className="bg-slate-900">
-                  <TableRow>
-                    <TableHead className="text-white">Parameter</TableHead>
-                    <TableHead className="text-white">Value/Basis</TableHead>
-                    <TableHead className="text-white">Category</TableHead>
-                    <TableHead className="text-white">Source File</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {assetAssumptions.map((item) => (
-                    <TableRow key={item.parameter} className="hover:bg-slate-50">
-                      <TableCell className="font-medium">{item.parameter}</TableCell>
-                      <TableCell>{item.value}</TableCell>
-                      <TableCell>{item.category}</TableCell>
-                      <TableCell className="text-muted-foreground text-sm">{item.source}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
-        </TabsContent>
-      </Tabs>
     </div>
   );
 };
