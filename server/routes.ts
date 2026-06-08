@@ -5,6 +5,10 @@ import path from "path";
 import { spawn, exec } from "child_process";
 import { randomUUID } from "crypto";
 import * as XLSX from "xlsx";
+import {
+  buildIndex, indexStatus, retrieve, invalidateCache,
+  EMBED_MODEL, type BuildProgress, type RetrievedChunk,
+} from "./rag";
 
 // Directory that contains product folders (e.g. C:\projects\UL).
 // Override with PRODUCTS_DIR env var; defaults to the parent of this app's root.
@@ -1356,7 +1360,20 @@ export async function registerRoutes(
   // ===========================================================================
 
   const OLLAMA_BASE = process.env.OLLAMA_BASE ?? "http://localhost:11434";
-  const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen2.5-coder:7b";
+  const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen2.5-coder:3b";
+
+  // Default corpus to "train" on: docs + model scripts across the projects.
+  // Only paths that actually exist are kept. All relative to EDITOR_ROOT.
+  function defaultIndexSources(): string[] {
+    const candidates = [
+      "UL/docs", "UL/ulp_model", "UL/app",
+      "VA/docs",
+      "Updated-FIA-Validation-Tool-UI/docs",
+    ];
+    return candidates.filter((rel) => {
+      try { return fs.existsSync(path.resolve(EDITOR_ROOT, rel)); } catch { return false; }
+    });
+  }
 
   // GET /api/local-llm/status — check if Ollama is reachable and list models
   app.get("/api/local-llm/status", async (_req: any, res: any) => {
@@ -1365,30 +1382,103 @@ export async function registerRoutes(
       if (!r.ok) return res.status(502).json({ running: false, error: "Ollama returned non-OK" });
       const data = await r.json() as { models: { name: string }[] };
       const models = (data.models ?? []).map((m: { name: string }) => m.name);
-      res.json({ running: true, models, activeModel: OLLAMA_MODEL });
+      res.json({
+        running: true, models, activeModel: OLLAMA_MODEL,
+        embedModel: EMBED_MODEL,
+        embedModelReady: models.some((m) => m.startsWith(EMBED_MODEL)),
+        index: indexStatus(),
+      });
     } catch {
-      res.status(502).json({ running: false, error: "Ollama not reachable — run: ollama serve" });
+      res.status(502).json({ running: false, error: "Ollama not reachable — run: ollama serve", index: indexStatus() });
     }
   });
 
-  // POST /api/local-llm/chat — streaming chat completions via Ollama
-  // Body: { message, code?, filename?, language?, model? }
+  // GET /api/local-llm/index/status — describe the current RAG index
+  app.get("/api/local-llm/index/status", (_req: any, res: any) => {
+    res.json({ ...indexStatus(), defaultSources: defaultIndexSources() });
+  });
+
+  // POST /api/local-llm/index — (re)build the RAG index. Streams progress as SSE.
+  // Body: { sources?: string[], embedModel?: string }
+  app.post("/api/local-llm/index", async (req: any, res: any) => {
+    const { sources, embedModel } = req.body as { sources?: string[]; embedModel?: string };
+    const roots = (sources?.length ? sources : defaultIndexSources())
+      .map((s) => String(s).replace(/^[/\\]+/, ""));
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("X-Accel-Buffering", "no");
+
+    const send = (p: BuildProgress) => res.write(`data: ${JSON.stringify(p)}\n\n`);
+
+    try {
+      await buildIndex(EDITOR_ROOT, roots, embedModel ?? EMBED_MODEL, send);
+      invalidateCache();
+    } catch (err) {
+      send({ phase: "error", message: err instanceof Error ? err.message : String(err) });
+    }
+    res.write("data: [DONE]\n\n");
+    res.end();
+  });
+
+  // POST /api/local-llm/chat — streaming chat completions via Ollama, grounded
+  // in the RAG index and any attached / target files.
+  // Body: { message, code?, filename?, language?, model?,
+  //         useRag?, targetFile?, attachments?: [{ name, content }] }
   app.post("/api/local-llm/chat", async (req: any, res: any) => {
-    const { message, code, filename, language, model } = req.body as {
+    const {
+      message, code, filename, language, model,
+      useRag = true, targetFile, attachments = [],
+    } = req.body as {
       message: string; code?: string; filename?: string;
       language?: string; model?: string;
+      useRag?: boolean; targetFile?: string;
+      attachments?: { name: string; content: string }[];
     };
     if (!message) return res.status(400).json({ error: "message required" });
 
     const useModel = model ?? OLLAMA_MODEL;
 
-    const systemPrompt = filename
-      ? `You are an expert coding assistant. The user is editing "${filename}" (${language ?? "code"}). Help them write, understand, fix, or improve their code. Be concise. Use code blocks where helpful.`
-      : "You are an expert coding assistant. Help the user with their coding questions. Be concise and accurate.";
+    // ---- Retrieve grounding context from the index ----
+    let retrieved: RetrievedChunk[] = [];
+    if (useRag && indexStatus().exists) {
+      try { retrieved = await retrieve(message, 5); } catch { /* fall back to no-RAG */ }
+    }
 
-    const userContent = code?.trim()
-      ? `Here is the current file:\n\`\`\`${language ?? ""}\n${code}\n\`\`\`\n\n${message}`
-      : message;
+    const systemPrompt =
+      "You are an expert coding assistant embedded in the FIA / actuarial model validation tool. " +
+      "You are given excerpts from THIS project's documentation and source code as CONTEXT. " +
+      "Base your answer on that context and follow the existing logic, naming, and conventions. " +
+      "When asked to change a file, return the exact, complete code for the relevant section in a code block. " +
+      "If the context does not cover something, say so rather than inventing APIs. Be concise." +
+      (filename ? ` The user is currently editing "${filename}" (${language ?? "code"}).` : "") +
+      (targetFile ? ` The user wants to UPDATE the file "${targetFile}" — scope your code suggestions to that file.` : "");
+
+    // ---- Assemble the user turn: context + attachments + current/target file + question ----
+    const parts: string[] = [];
+
+    if (retrieved.length) {
+      parts.push(
+        "### CONTEXT — relevant excerpts from this project\n" +
+        retrieved
+          .map((c) => `From ${c.source} (lines ${c.startLine}-${c.endLine}):\n\`\`\`\n${c.text}\n\`\`\``)
+          .join("\n\n"),
+      );
+    }
+
+    for (const att of attachments) {
+      if (!att?.content) continue;
+      const trimmed = att.content.length > 12_000 ? att.content.slice(0, 12_000) + "\n…(truncated)" : att.content;
+      parts.push(`### ATTACHED FILE: ${att.name}\n\`\`\`\n${trimmed}\n\`\`\``);
+    }
+
+    if (code?.trim()) {
+      const label = targetFile && targetFile === filename ? `TARGET FILE (to update): ${filename}` : `CURRENT FILE: ${filename ?? ""}`;
+      parts.push(`### ${label}\n\`\`\`${language ?? ""}\n${code}\n\`\`\``);
+    }
+
+    parts.push(`### REQUEST\n${message}`);
+    const userContent = parts.join("\n\n");
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -1401,12 +1491,20 @@ export async function registerRoutes(
         body: JSON.stringify({
           model: useModel,
           stream: true,
+          // Keep the model resident in RAM so it isn't reloaded (slow on CPU)
+          // between prompts. Cap output and context to keep responses snappy.
+          keep_alive: process.env.OLLAMA_KEEP_ALIVE ?? "30m",
+          options: {
+            num_predict: Number(process.env.OLLAMA_NUM_PREDICT ?? 1024),
+            num_ctx: Number(process.env.OLLAMA_NUM_CTX ?? 8192),
+            temperature: 0.1,
+          },
           messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: userContent },
           ],
         }),
-        signal: AbortSignal.timeout(120000),
+        signal: AbortSignal.timeout(180000),
       });
 
       if (!ollamaRes.ok) {

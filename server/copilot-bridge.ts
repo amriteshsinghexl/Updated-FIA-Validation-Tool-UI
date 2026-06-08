@@ -98,7 +98,9 @@ function startLSP() {
 
   lsp.stderr?.on("data", (d: Buffer) => {
     const line = d.toString().trim();
-    if (line) console.log("[CopilotLSP]", line);
+    // The language server is very chatty on stderr; only surface it when
+    // DEBUG_COPILOT=1, otherwise it floods the terminal.
+    if (line && process.env.DEBUG_COPILOT === "1") console.log("[CopilotLSP]", line);
   });
 
   lsp.on("exit", (code) => {

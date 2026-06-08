@@ -18,6 +18,7 @@ import {
   Save, RefreshCw, Loader2, AlertCircle, Bot,
   FilePlus, FolderPlus, Trash2, Settings,
   ExternalLink, Copy, Check, LogOut, User,
+  Paperclip, Upload, Database, Sparkles, FileText, Target,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -59,6 +60,15 @@ function ext(name: string) {
 }
 function getLang(name: string) { return LANG_MAP[ext(name)] ?? "plaintext"; }
 function getIcon(name: string) { return ICON_MAP[ext(name)] ?? "📄"; }
+
+/** Flatten a file tree into a sorted list of file paths (directories omitted). */
+function flattenFiles(nodes: FsNode[], acc: string[] = []): string[] {
+  for (const n of nodes) {
+    if (n.type === "file") acc.push(n.path);
+    else if (n.children) flattenFiles(n.children, acc);
+  }
+  return acc;
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -822,6 +832,21 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
   const [copilotNotEnabled, setCopilotNotEnabled] = useState(false);
   const chatBottomRef = useRef<HTMLDivElement>(null);
 
+  // ---------- prompt attachments / target file / RAG ----------
+  interface Attachment { name: string; content: string; fromTree: boolean; }
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [targetFile, setTargetFile] = useState<string | null>(null);
+  const [useRag, setUseRag] = useState(() => localStorage.getItem("llm_use_rag") !== "false");
+  const [showAttachMenu, setShowAttachMenu] = useState(false);
+  const [attachFilter, setAttachFilter] = useState("");
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+
+  // ---------- RAG index / "training" ----------
+  interface IndexStatus { exists: boolean; builtAt?: string; chunkCount?: number; sources?: string[]; defaultSources?: string[]; }
+  const [indexInfo, setIndexInfo] = useState<IndexStatus>({ exists: false });
+  const [indexing, setIndexing] = useState(false);
+  const [indexProgress, setIndexProgress] = useState<{ current: number; total: number; phase: string; message?: string } | null>(null);
+
   // ---------- AI provider settings ----------
   type AIProvider = "copilot" | "openai" | "anthropic" | "azure" | "gemini" | "ollama";
   const [aiProvider, setAiProvider] = useState<AIProvider>(
@@ -866,9 +891,9 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
       { value: "gemini-1.5-flash", label: "Gemini 1.5 Flash" },
     ],
     ollama: [
-      { value: "qwen2.5-coder:7b", label: "Qwen 2.5 Coder 7B ✓ installed" },
-      { value: "codellama:7b", label: "Code Llama 7B" },
-      { value: "llama3.2:3b", label: "Llama 3.2 3B (fast)" },
+      { value: "qwen2.5-coder:3b", label: "Qwen2.5 Coder 3B (recommended for this PC)" },
+      { value: "llama3.2:3b", label: "Llama 3.2 3B (fast, general)" },
+      { value: "qwen2.5-coder:7b", label: "Qwen2.5 Coder 7B (smarter, slow on CPU)" },
       { value: "deepseek-coder:6.7b", label: "DeepSeek Coder 6.7B" },
     ],
   };
@@ -1078,6 +1103,145 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
     setGithubUser(null);
   }
 
+  // ---- prompt attachments ----
+  const allFiles = React.useMemo(() => flattenFiles(tree), [tree]);
+
+  // Model dropdown options. For Ollama, list every model the user has pulled
+  // (live from /api/local-llm/status) automatically — no code edit needed —
+  // then append curated suggestions they haven't pulled yet.
+  const modelOptions = React.useMemo(() => {
+    if (aiProvider !== "ollama") return AI_MODELS[aiProvider];
+    const curated = AI_MODELS.ollama;
+    const niceLabel = (tag: string) => {
+      const hit = curated.find((c) => c.value === tag || `${c.value}:latest` === tag);
+      return hit ? hit.label.replace(/\s*\(.*\)$/, "") : tag;
+    };
+    // Installed chat models (exclude embedding models — not usable for chat).
+    const installed = ollamaModels
+      .filter((m) => !/embed/i.test(m))
+      .map((m) => ({ value: m, label: `${niceLabel(m)}  ✓ installed` }));
+    // Curated suggestions not yet pulled.
+    const suggestions = curated
+      .filter((c) => !ollamaModels.some((m) => m === c.value || m === `${c.value}:latest`))
+      .map((c) => ({ value: c.value, label: `${c.label}  ⤓ pull required` }));
+    return [...installed, ...suggestions];
+  }, [aiProvider, ollamaModels]);
+
+  // Default the "target file to update" to the active tab.
+  useEffect(() => { if (activeTab) setTargetFile(activeTab); }, [activeTab]);
+
+  async function attachFromTree(filePath: string) {
+    if (attachments.some((a) => a.name === filePath)) { setShowAttachMenu(false); return; }
+    try {
+      const content = await apiRead(filePath);
+      setAttachments((p) => [...p, { name: filePath, content, fromTree: true }]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not attach file");
+    }
+    setShowAttachMenu(false);
+    setAttachFilter("");
+  }
+
+  function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files ?? []);
+    files.forEach((file) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        setAttachments((p) => [
+          ...p.filter((a) => a.name !== file.name),
+          { name: file.name, content: String(reader.result ?? ""), fromTree: false },
+        ]);
+      };
+      reader.readAsText(file);
+    });
+    if (uploadInputRef.current) uploadInputRef.current.value = "";
+  }
+
+  function removeAttachment(name: string) {
+    setAttachments((p) => p.filter((a) => a.name !== name));
+  }
+
+  // ---- apply AI output back to the editor (no GitHub needed) ----
+  /** Pull the largest fenced code block out of an assistant reply. */
+  function extractCode(text: string): string | null {
+    const blocks = [...text.matchAll(/```[a-zA-Z0-9]*\n([\s\S]*?)```/g)].map((m) => m[1].replace(/\n$/, ""));
+    if (!blocks.length) return null;
+    return blocks.sort((a, b) => b.length - a.length)[0];
+  }
+
+  /** Insert code at the cursor in the active Monaco editor. */
+  function insertIntoEditor(code: string) {
+    const ed = editorRef.current;
+    if (!ed || !activeTab) return;
+    const sel = ed.getSelection();
+    if (sel) ed.executeEdits("ai-insert", [{ range: sel, text: code, forceMoveMarkers: true }]);
+    ed.focus();
+  }
+
+  /** Replace the whole active file with code (then Ctrl+S / Save persists it). */
+  function replaceEditorContent(code: string) {
+    if (!activeTab) return;
+    setTabs((p) => p.map((t) => t.path === activeTab ? { ...t, content: code } : t));
+    copilot.current.changeDoc(activeTab, code);
+  }
+
+  // ---- RAG index ("training") ----
+  const refreshIndexStatus = useCallback(async () => {
+    try {
+      const r = await fetch("/api/local-llm/index/status");
+      setIndexInfo(await r.json());
+    } catch { setIndexInfo({ exists: false }); }
+  }, []);
+
+  useEffect(() => { if (open) refreshIndexStatus(); }, [open, refreshIndexStatus]);
+
+  function toggleRag(v: boolean) {
+    setUseRag(v);
+    localStorage.setItem("llm_use_rag", String(v));
+  }
+
+  async function runIndexing() {
+    setIndexing(true);
+    setIndexProgress({ current: 0, total: 0, phase: "scanning", message: "Starting…" });
+    try {
+      const res = await fetch("/api/local-llm/index", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}), // use server default sources
+      });
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("No progress stream");
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split("\n");
+        buf = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const raw = line.slice(6).trim();
+          if (raw === "[DONE]") continue;
+          try {
+            const p = JSON.parse(raw);
+            if (p.phase === "error") { setError(p.message ?? "Indexing failed"); continue; }
+            setIndexProgress({
+              current: p.current ?? 0, total: p.total ?? 0,
+              phase: p.phase, message: p.message,
+            });
+          } catch { /* ignore partial */ }
+        }
+      }
+      await refreshIndexStatus();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Indexing failed");
+    } finally {
+      setIndexing(false);
+      setTimeout(() => setIndexProgress(null), 2500);
+    }
+  }
+
   // ---- AI chat (Copilot or alternative provider) ----
   async function sendChat() {
     const msg = chatInput.trim();
@@ -1090,6 +1254,17 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
     const apiKey = localStorage.getItem("ai_api_key") ?? aiApiKey;
     const model = localStorage.getItem("ai_model") ?? aiModel;
     const azureEndpoint = localStorage.getItem("ai_azure_endpoint") ?? aiAzureEndpoint;
+
+    // For providers without structured attachment support, fold attachments
+    // (and the target-file hint) into the message text.
+    const attachmentText = attachments.length
+      ? "\n\n" + attachments
+          .map((a) => `### Attached file: ${a.name}\n\`\`\`\n${a.content.slice(0, 12000)}\n\`\`\``)
+          .join("\n\n")
+      : "";
+    const targetHint = targetFile && targetFile !== active?.path
+      ? `\n\n(Scope your code suggestions to updating the file: ${targetFile})`
+      : "";
 
     const commonPayload = {
       message: msg,
@@ -1106,7 +1281,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
         res = await fetch("/api/code-editor/copilot-chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...commonPayload, githubToken: token }),
+          body: JSON.stringify({ ...commonPayload, message: msg + targetHint + attachmentText, githubToken: token }),
         });
         if (!res.ok) {
           const d = await res.json().catch(() => ({ error: res.statusText }));
@@ -1124,7 +1299,10 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...commonPayload,
-            model: model || "qwen2.5-coder:7b",
+            model: model || "qwen2.5-coder:3b",
+            useRag,
+            targetFile: targetFile ?? undefined,
+            attachments: attachments.map((a) => ({ name: a.name, content: a.content })),
           }),
         });
         if (!res.ok) {
@@ -1138,6 +1316,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...commonPayload,
+            message: msg + targetHint + attachmentText,
             provider,
             apiKey,
             model: model || undefined,
@@ -1538,6 +1717,79 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
                   </div>
                 )}
 
+                {/* ── Train on docs & scripts (RAG) ── */}
+                {aiProvider === "ollama" && (
+                  <div className="rounded p-2.5 space-y-2" style={{ background: "#1e1e1e", border: "1px solid #3c3c3c" }}>
+                    <div className="flex items-center gap-1.5">
+                      <Database className="h-3.5 w-3.5 text-purple-400" />
+                      <span className="text-[11px] font-semibold text-[#d4d4d4]">Train on docs &amp; scripts</span>
+                    </div>
+                    <p className="text-[10px] text-[#969696] leading-relaxed">
+                      Indexes the project docs and model scripts so the assistant answers from <em>your</em> logic
+                      and suggests code that matches it. Re-run after docs change.
+                    </p>
+
+                    {/* Index status */}
+                    <div className="text-[10px] text-[#5c5c5c]">
+                      {indexInfo.exists ? (
+                        <span className="text-green-400">
+                          ● Indexed {indexInfo.chunkCount} chunks · {indexInfo.builtAt ? new Date(indexInfo.builtAt).toLocaleString() : ""}
+                        </span>
+                      ) : (
+                        <span className="text-amber-500">● Not trained yet</span>
+                      )}
+                    </div>
+                    {indexInfo.exists && indexInfo.sources?.length ? (
+                      <p className="text-[10px] text-[#5c5c5c] truncate">Sources: {indexInfo.sources.join(", ")}</p>
+                    ) : null}
+
+                    {/* Progress */}
+                    {indexProgress && (
+                      <div className="space-y-1">
+                        <div className="h-1.5 rounded-full overflow-hidden" style={{ background: "#3c3c3c" }}>
+                          <div
+                            className="h-full transition-all"
+                            style={{
+                              background: "#8b5cf6",
+                              width: indexProgress.total
+                                ? `${Math.round((indexProgress.current / indexProgress.total) * 100)}%`
+                                : "30%",
+                            }}
+                          />
+                        </div>
+                        <p className="text-[10px] text-[#969696] truncate">
+                          {indexProgress.phase === "embedding"
+                            ? `Embedding ${indexProgress.current}/${indexProgress.total}…`
+                            : indexProgress.message ?? indexProgress.phase}
+                        </p>
+                      </div>
+                    )}
+
+                    <button
+                      onClick={runIndexing}
+                      disabled={indexing || !ollamaRunning}
+                      className="w-full py-1.5 rounded text-[11px] font-semibold text-white disabled:opacity-40 flex items-center justify-center gap-1.5"
+                      style={{ background: "#7c3aed" }}
+                      title={!ollamaRunning ? "Start Ollama first" : undefined}
+                    >
+                      {indexing
+                        ? <><Loader2 className="h-3 w-3 animate-spin" /> Training…</>
+                        : <><Sparkles className="h-3 w-3" /> {indexInfo.exists ? "Re-train on docs" : "Train on docs"}</>}
+                    </button>
+
+                    {/* RAG toggle */}
+                    <label className="flex items-center gap-2 cursor-pointer pt-0.5">
+                      <input
+                        type="checkbox"
+                        checked={useRag}
+                        onChange={(e) => toggleRag(e.target.checked)}
+                        className="accent-purple-500"
+                      />
+                      <span className="text-[10px] text-[#c5c5c5]">Use trained knowledge when answering</span>
+                    </label>
+                  </div>
+                )}
+
                 {/* API Key */}
                 {aiProvider !== "copilot" && aiProvider !== "ollama" && (
                   <div>
@@ -1596,7 +1848,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
                       className="w-full px-2 py-1.5 rounded outline-none text-white text-xs"
                       style={{ background: "#3c3c3c", border: "1px solid #5c5c5c" }}
                     >
-                      {AI_MODELS[aiProvider].map((m) => (
+                      {modelOptions.map((m) => (
                         <option key={m.value} value={m.value}>{m.label}</option>
                       ))}
                     </select>
@@ -1730,7 +1982,10 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
               {chatMsgs.length === 0 && (
                 <div className="text-center py-8 space-y-2">
                   <Bot className="h-10 w-10 mx-auto text-[#3c3c3c]" />
-                  <p className="text-xs text-[#5c5c5c]">Ask Copilot about the open file</p>
+                  <p className="text-xs text-[#5c5c5c]">Ask {AI_PROVIDER_LABELS[aiProvider]} about your code</p>
+                  {aiProvider === "ollama" && indexInfo.exists && useRag && (
+                    <p className="text-[10px] text-purple-400">✓ grounded in your docs &amp; scripts</p>
+                  )}
                   <div className="text-[10px] text-[#3c3c3c] space-y-1 text-left mx-auto max-w-[220px]">
                     {["explain this function", "add error handling", "write unit tests", "refactor this code"].map((s) => (
                       <p key={s} className="px-2 py-1 rounded cursor-pointer hover:text-[#5c5c5c]"
@@ -1746,40 +2001,174 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
                 <div key={i} className={cn("text-xs rounded p-2 leading-relaxed", m.role === "user" ? "ml-4" : "mr-4")}
                   style={{ background: m.role === "user" ? "#252526" : "#1a2a1a" }}>
                   <span className={cn("text-[10px] font-bold block mb-1", m.role === "user" ? "text-blue-400" : "text-green-400")}>
-                    {m.role === "user" ? "You" : "● Copilot"}
+                    {m.role === "user" ? "You" : `● ${AI_PROVIDER_LABELS[aiProvider]}`}
                   </span>
                   <pre className="whitespace-pre-wrap font-mono text-[11px]">{m.text || <Loader2 className="h-3 w-3 animate-spin inline" />}</pre>
+                  {m.role === "assistant" && active && extractCode(m.text) && (
+                    <div className="flex flex-wrap gap-1 mt-1.5 pt-1.5 border-t" style={{ borderColor: "#2a3a2a" }}>
+                      <button
+                        onClick={() => insertIntoEditor(extractCode(m.text)!)}
+                        className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-white"
+                        style={{ background: "#0e639c" }}
+                        title={`Insert code at cursor in ${active.path.split("/").pop()}`}>
+                        <FilePlus className="h-3 w-3" /> Insert into editor
+                      </button>
+                      <button
+                        onClick={() => { if (confirm(`Replace the entire contents of ${active.path.split("/").pop()}? Save (Ctrl+S) to write it to disk.`)) replaceEditorContent(extractCode(m.text)!); }}
+                        className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-[#d4d4d4] hover:text-white"
+                        style={{ background: "#3c3c3c" }}
+                        title={`Replace all of ${active.path.split("/").pop()} with this code`}>
+                        <RefreshCw className="h-3 w-3" /> Replace file
+                      </button>
+                      <button
+                        onClick={() => navigator.clipboard.writeText(extractCode(m.text)!)}
+                        className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-[#969696] hover:text-white hover:bg-[#3c3c3c]"
+                        title="Copy code">
+                        <Copy className="h-3 w-3" /> Copy
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))}
               <div ref={chatBottomRef} />
             </div>
 
             {/* Chat input */}
-            <div className="p-2 shrink-0 border-t" style={{ borderColor: "#3c3c3c" }}>
-              {!active && <p className="text-[10px] text-[#5c5c5c] mb-1">Open a file to chat about it</p>}
-              {!ghToken && !githubUser && active && (
+            <div className="p-2 shrink-0 border-t relative" style={{ borderColor: "#3c3c3c" }}>
+              {!active && attachments.length === 0 &&
+                <p className="text-[10px] text-[#5c5c5c] mb-1">Open or attach a file to chat about it</p>}
+              {aiProvider === "copilot" && !ghToken && !githubUser && active && (
                 <p className="text-[10px] text-amber-600 mb-1">
                   <button onClick={() => setShowGitHubAuth(true)} className="underline hover:text-amber-500">
                     Sign in to GitHub
                   </button>{" "}or add token (⚙) to enable chat
                 </p>
               )}
+
+              {/* Context chips — the open editor file is auto-inserted, plus any attachments */}
+              {(active || attachments.length > 0) && (
+                <div className="flex flex-wrap gap-1 mb-1.5">
+                  {active && (
+                    <span
+                      className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-amber-200"
+                      style={{ background: "#2d2400", border: "1px solid #5c4a00" }}
+                      title={`${active.path} — current editor file, included in the prompt`}>
+                      <FileText className="h-3 w-3 text-amber-400 shrink-0" />
+                      <span className="max-w-[120px] truncate">{active.path.split("/").pop()}</span>
+                      <span className="text-[8px] text-[#a88600]">in editor</span>
+                    </span>
+                  )}
+                  {attachments.map((a) => (
+                    <span key={a.name}
+                      className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-[#d4d4d4]"
+                      style={{ background: "#252526", border: "1px solid #3c3c3c" }}
+                      title={a.name}>
+                      <FileText className="h-3 w-3 text-blue-400 shrink-0" />
+                      <span className="max-w-[120px] truncate">{a.name.split("/").pop()}</span>
+                      {!a.fromTree && <span className="text-[8px] text-[#5c5c5c]">(upload)</span>}
+                      <button onClick={() => removeAttachment(a.name)} className="text-[#5c5c5c] hover:text-red-400">
+                        <X className="h-2.5 w-2.5" />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {/* Target file + attach controls */}
+              <div className="flex items-center gap-1 mb-1.5">
+                <button
+                  onClick={() => { setShowAttachMenu((v) => !v); setAttachFilter(""); }}
+                  className="flex items-center gap-1 px-1.5 py-1 rounded text-[10px] text-[#969696] hover:text-white hover:bg-[#3c3c3c]"
+                  title="Attach files as context"
+                >
+                  <Paperclip className="h-3 w-3" /> Attach
+                </button>
+                <button
+                  onClick={() => uploadInputRef.current?.click()}
+                  className="flex items-center gap-1 px-1.5 py-1 rounded text-[10px] text-[#969696] hover:text-white hover:bg-[#3c3c3c]"
+                  title="Upload a file from your computer"
+                >
+                  <Upload className="h-3 w-3" /> Upload
+                </button>
+                <input ref={uploadInputRef} type="file" multiple className="hidden" onChange={handleUpload} />
+
+                <div className="flex items-center gap-1 ml-auto min-w-0">
+                  <Target className="h-3 w-3 text-amber-400 shrink-0" />
+                  <select
+                    value={targetFile ?? ""}
+                    onChange={(e) => setTargetFile(e.target.value || null)}
+                    className="max-w-[150px] truncate rounded px-1 py-0.5 text-[10px] text-[#d4d4d4] outline-none"
+                    style={{ background: "#3c3c3c", border: "1px solid #5c5c5c" }}
+                    title="File the assistant should write code for"
+                  >
+                    <option value="">No target file</option>
+                    {Array.from(new Set([
+                      ...tabs.map((t) => t.path),
+                      ...attachments.filter((a) => a.fromTree).map((a) => a.name),
+                      ...(targetFile ? [targetFile] : []),
+                    ])).map((p) => (
+                      <option key={p} value={p}>{p.split("/").pop()}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {/* Attach popover — searchable list over the project tree */}
+              {showAttachMenu && (
+                <div
+                  className="absolute bottom-full left-2 right-2 mb-1 rounded shadow-xl overflow-hidden z-50"
+                  style={{ background: "#252526", border: "1px solid #454545" }}
+                >
+                  <input
+                    autoFocus
+                    value={attachFilter}
+                    onChange={(e) => setAttachFilter(e.target.value)}
+                    placeholder="Filter files… (e.g. model.py)"
+                    className="w-full px-2 py-1.5 text-[11px] text-white outline-none border-b"
+                    style={{ background: "#3c3c3c", borderColor: "#3c3c3c" }}
+                  />
+                  <div className="max-h-52 overflow-y-auto py-1">
+                    {allFiles
+                      .filter((f) => f.toLowerCase().includes(attachFilter.toLowerCase()))
+                      .slice(0, 60)
+                      .map((f) => {
+                        const attached = attachments.some((a) => a.name === f);
+                        return (
+                          <button
+                            key={f}
+                            onClick={() => attachFromTree(f)}
+                            disabled={attached}
+                            className="w-full flex items-center gap-1.5 px-2 py-1 text-[11px] text-left hover:bg-[#094771] disabled:opacity-40"
+                          >
+                            <span className="text-[10px] shrink-0">{getIcon(f)}</span>
+                            <span className="flex-1 truncate text-[#d4d4d4]">{f}</span>
+                            {attached && <Check className="h-3 w-3 text-green-400 shrink-0" />}
+                          </button>
+                        );
+                      })}
+                    {allFiles.filter((f) => f.toLowerCase().includes(attachFilter.toLowerCase())).length === 0 && (
+                      <p className="px-2 py-2 text-[10px] text-[#5c5c5c]">No files match.</p>
+                    )}
+                  </div>
+                </div>
+              )}
+
               <div className="flex gap-1">
                 <textarea
                   className="flex-1 resize-none rounded px-2 py-1.5 text-xs text-white placeholder-[#5c5c5c] outline-none"
                   style={{ background: "#3c3c3c", border: "1px solid #5c5c5c" }}
                   rows={2}
-                  placeholder="Ask Copilot… (Enter to send)"
+                  placeholder={aiProvider === "ollama" ? "Ask the local model… (Enter to send)" : "Ask the assistant… (Enter to send)"}
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
-                  disabled={!active}
+                  disabled={!active && attachments.length === 0}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
                   }}
                 />
                 <button
                   onClick={sendChat}
-                  disabled={!active || !chatInput.trim() || chatLoading}
+                  disabled={(!active && attachments.length === 0) || !chatInput.trim() || chatLoading}
                   className="px-2 rounded text-xs font-semibold text-white disabled:opacity-30 transition-colors"
                   style={{ background: "#007acc" }}
                 >

@@ -5,3 +5,6 @@ dist/
 coverage/
 .cache/
 .vscode/
+# Local LLM RAG vector index (regenerated via the "Train on docs" button)
+rag-index.json
+dev-server.log

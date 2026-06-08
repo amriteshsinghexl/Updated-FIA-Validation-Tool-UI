@@ -35,27 +35,44 @@ export function log(message: string, source = "express") {
   console.log(`${formattedTime} [${source}] ${message}`);
 }
 
+// High-frequency / streaming endpoints we don't want flooding the terminal.
+const QUIET_PATHS = [
+  "/api/local-llm/status",
+  "/api/local-llm/index/status",
+  "/api/local-llm/chat",
+  "/api/local-llm/index",
+  "/api/code-editor/tree",
+];
+// Set DEBUG_HTTP=1 to restore full per-request logging (incl. response bodies).
+const DEBUG_HTTP = process.env.DEBUG_HTTP === "1";
+
 app.use((req, res, next) => {
   const start = Date.now();
   const path = req.path;
   let capturedJsonResponse: Record<string, any> | undefined = undefined;
 
-  const originalResJson = res.json;
-  res.json = function (bodyJson, ...args) {
-    capturedJsonResponse = bodyJson;
-    return originalResJson.apply(res, [bodyJson, ...args]);
-  };
+  if (DEBUG_HTTP) {
+    const originalResJson = res.json;
+    res.json = function (bodyJson, ...args) {
+      capturedJsonResponse = bodyJson;
+      return originalResJson.apply(res, [bodyJson, ...args]);
+    };
+  }
 
   res.on("finish", () => {
+    if (!path.startsWith("/api")) return;
     const duration = Date.now() - start;
-    if (path.startsWith("/api")) {
-      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
-      if (capturedJsonResponse) {
-        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
-      }
-
-      log(logLine);
+    // By default keep the terminal calm: skip chatty/streaming paths and only
+    // surface errors or genuinely slow calls. Use DEBUG_HTTP=1 for everything.
+    if (!DEBUG_HTTP) {
+      const isQuiet = QUIET_PATHS.some((p) => path.startsWith(p));
+      if (isQuiet && res.statusCode < 400 && duration < 2000) return;
+      log(`${req.method} ${path} ${res.statusCode} in ${duration}ms`);
+      return;
     }
+    let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
+    if (capturedJsonResponse) logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+    log(logLine);
   });
 
   next();

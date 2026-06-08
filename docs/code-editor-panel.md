@@ -19,6 +19,7 @@ Clicking **View Code** in the top ribbon opens the panel as a full-screen overla
 | Copilot inline completions | Ghost-text suggestions as you type, powered by `@github/copilot-language-server` |
 | Copilot authentication | Device-code OAuth flow — one-time sign-in via `github.com/login/device` |
 | Copilot Chat | Right-side chat panel — ask questions about the open file; responses stream in real time |
+| Local LLM + RAG | Run a model fully offline via Ollama, attach files/target a file, and "train" on project docs+scripts. See [local-llm-training.md](local-llm-training.md) |
 | Right-click context menu | New File, New Folder, Delete on any tree node |
 | Create files/folders inline | Type a name and press Enter directly in the explorer sidebar |
 
