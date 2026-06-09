@@ -830,6 +830,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
   const [chatLoading, setChatLoading] = useState(false);
   const [ghToken, setGhToken] = useState(() => localStorage.getItem("gh_copilot_token") ?? "");
   const [copilotNotEnabled, setCopilotNotEnabled] = useState(false);
+  const [genElapsed, setGenElapsed] = useState(0); // seconds the current request has been running
   const chatBottomRef = useRef<HTMLDivElement>(null);
 
   // ---------- prompt attachments / target file / RAG ----------
@@ -891,7 +892,8 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
       { value: "gemini-1.5-flash", label: "Gemini 1.5 Flash" },
     ],
     ollama: [
-      { value: "qwen2.5-coder:3b", label: "Qwen2.5 Coder 3B (recommended for this PC)" },
+      { value: "qwen2.5-coder:1.5b", label: "Qwen2.5 Coder 1.5B (fastest on CPU)" },
+      { value: "qwen2.5-coder:3b", label: "Qwen2.5 Coder 3B (balanced — default)" },
       { value: "llama3.2:3b", label: "Llama 3.2 3B (fast, general)" },
       { value: "qwen2.5-coder:7b", label: "Qwen2.5 Coder 7B (smarter, slow on CPU)" },
       { value: "deepseek-coder:6.7b", label: "DeepSeek Coder 6.7B" },
@@ -955,6 +957,15 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMsgs]);
+
+  // Tick an elapsed-seconds counter while a chat request is in flight, so the
+  // user can see the local model is still working (CPU responses are slow).
+  useEffect(() => {
+    if (!chatLoading) { setGenElapsed(0); return; }
+    const start = Date.now();
+    const id = setInterval(() => setGenElapsed(Math.round((Date.now() - start) / 1000)), 500);
+    return () => clearInterval(id);
+  }, [chatLoading]);
 
   useEffect(() => {
     if (!open) return;
@@ -1184,6 +1195,83 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
     setTabs((p) => p.map((t) => t.path === activeTab ? { ...t, content: code } : t));
     copilot.current.changeDoc(activeTab, code);
   }
+
+  /**
+   * Smart apply: find the line (or function) the snippet changes and replace it
+   * in place, preserving the file's indentation. Handles two common cases:
+   *   • a single assignment `x = …`  → replaces the matching `x =` line
+   *   • a `def`/`class` block        → replaces that whole function/class
+   * Falls back to inserting at the cursor (with a notice) if it can't locate a match.
+   */
+  function applySmart(code: string) {
+    const ed = editorRef.current;
+    const monaco = monacoRef.current;
+    const model = ed?.getModel?.() ?? null;
+    if (!ed || !monaco || !model) { insertIntoEditor(code); return; }
+
+    const snippetLines = code.replace(/\s+$/, "").split("\n");
+    const meaningful = snippetLines.filter((l) => l.trim() && !l.trim().startsWith("#"));
+    if (!meaningful.length) { insertIntoEditor(code); return; }
+
+    const fileLines: string[] = model.getValue().split(/\r?\n/);
+    const cursor = ed.getPosition()?.lineNumber ?? 1;
+    const eol = model.getEOL();
+
+    // Re-indent the snippet so its base indent matches the target line.
+    const snBase = Math.min(...snippetLines.filter((l) => l.trim()).map((l) => l.match(/^\s*/)![0].length));
+    const reindent = (target: string) =>
+      snippetLines.map((l) => (l.trim() === "" ? "" : target + l.slice(snBase))).join(eol);
+
+    let startLine = -1, endLine = -1, indent = "";
+
+    const asg = meaningful.length === 1 && meaningful[0].match(/^\s*([A-Za-z_][\w.[\]]*)\s*=(?!=)/);
+    const def = meaningful[0].match(/^\s*(def|class)\s+([A-Za-z_]\w*)/);
+
+    if (asg) {
+      const re = new RegExp("^\\s*" + asg[1].replace(/[.[\]]/g, "\\$&") + "\\s*=(?!=)");
+      const hits = fileLines.map((l, i) => (re.test(l) ? i : -1)).filter((i) => i >= 0);
+      if (hits.length) {
+        const best = hits.reduce((a, b) =>
+          Math.abs(b - (cursor - 1)) < Math.abs(a - (cursor - 1)) ? b : a);
+        startLine = endLine = best + 1;
+        indent = fileLines[best].match(/^\s*/)![0];
+      }
+    } else if (def) {
+      const re = new RegExp("^\\s*" + def[1] + "\\s+" + def[2] + "\\b");
+      const di = fileLines.findIndex((l) => re.test(l));
+      if (di >= 0) {
+        indent = fileLines[di].match(/^\s*/)![0];
+        let end = fileLines.length - 1;
+        for (let i = di + 1; i < fileLines.length; i++) {
+          if (fileLines[i].trim() === "") continue;
+          if (fileLines[i].match(/^\s*/)![0].length <= indent.length) { end = i - 1; break; }
+        }
+        startLine = di + 1; endLine = end + 1;
+      }
+    }
+
+    if (startLine < 0) {
+      insertIntoEditor(code);
+      setError("Couldn't locate the exact line to change — inserted at the cursor instead. For larger edits use 'Replace file'.");
+      return;
+    }
+
+    const range = new monaco.Range(startLine, 1, endLine, model.getLineMaxColumn(endLine));
+    ed.executeEdits("ai-apply", [{ range, text: reindent(indent), forceMoveMarkers: true }]);
+    ed.setSelection(new monaco.Range(startLine, 1, startLine, 1));
+    ed.revealLineInCenter(startLine);
+    ed.focus();
+  }
+
+  // ---- re-check Ollama + installed models (used by the status box and the
+  //      refresh button next to the model dropdown) ----
+  const refreshOllama = useCallback(() => {
+    setOllamaRunning(null);
+    fetch("/api/local-llm/status")
+      .then((r) => r.json())
+      .then((d) => { setOllamaRunning(d.running); setOllamaModels(d.models ?? []); })
+      .catch(() => { setOllamaRunning(false); setOllamaModels([]); });
+  }, []);
 
   // ---- RAG index ("training") ----
   const refreshIndexStatus = useCallback(async () => {
@@ -1629,17 +1717,22 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
                 <span className="text-xs font-semibold text-[#d4d4d4] truncate">
                   {AI_PROVIDER_LABELS[aiProvider]}
                 </span>
-                {aiProvider === "copilot" && (
+                {chatLoading && (
+                  <span className="flex items-center gap-1 text-[10px] text-amber-400 shrink-0 animate-pulse" title="The model is generating a response">
+                    <Loader2 className="h-3 w-3 animate-spin" /> generating {genElapsed}s
+                  </span>
+                )}
+                {!chatLoading && aiProvider === "copilot" && (
                   <span className={cn("text-[10px] font-medium shrink-0", statusColor[copilotStatus])}>
                     {copilotStatus === "ready" ? "● ready" :
                      copilotStatus === "authenticating" ? "● sign in" :
                      copilotStatus === "connecting" ? "○ …" : "○ off"}
                   </span>
                 )}
-                {aiProvider !== "copilot" && aiApiKey && (
+                {!chatLoading && aiProvider !== "copilot" && aiProvider !== "ollama" && aiApiKey && (
                   <span className="text-[10px] text-green-400 shrink-0">● ready</span>
                 )}
-                {aiProvider !== "copilot" && !aiApiKey && (
+                {!chatLoading && aiProvider !== "copilot" && aiProvider !== "ollama" && !aiApiKey && (
                   <span className="text-[10px] text-amber-400 shrink-0">⚠ no key</span>
                 )}
               </div>
@@ -1693,13 +1786,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
                         {ollamaRunning === null ? "○ checking…" : ollamaRunning ? "● Ollama running" : "● Ollama not running"}
                       </span>
                       <button className="text-[10px] text-[#5c5c5c] hover:text-white ml-auto"
-                        onClick={() => {
-                          setOllamaRunning(null);
-                          fetch("/api/local-llm/status").then(r => r.json()).then(d => {
-                            setOllamaRunning(d.running);
-                            setOllamaModels(d.models ?? []);
-                          }).catch(() => setOllamaRunning(false));
-                        }}>
+                        onClick={refreshOllama}>
                         refresh
                       </button>
                     </div>
@@ -1831,7 +1918,20 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
 
                 {/* Model selector */}
                 <div>
-                  <label className="block text-[#969696] mb-1">Model</label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-[#969696]">Model</label>
+                    {aiProvider === "ollama" && (
+                      <button
+                        onClick={refreshOllama}
+                        disabled={ollamaRunning === null}
+                        className="flex items-center gap-1 text-[10px] text-[#5c5c5c] hover:text-white disabled:opacity-40"
+                        title="Re-check Ollama and refresh the installed-model list"
+                      >
+                        <RefreshCw className={cn("h-3 w-3", ollamaRunning === null && "animate-spin")} />
+                        refresh models
+                      </button>
+                    )}
+                  </div>
                   {aiProvider === "azure" ? (
                     <input
                       type="text"
@@ -1997,21 +2097,42 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
                   </div>
                 </div>
               )}
-              {chatMsgs.map((m, i) => (
+              {chatMsgs.map((m, i) => {
+                const isStreaming = chatLoading && m.role === "assistant" && i === chatMsgs.length - 1;
+                return (
                 <div key={i} className={cn("text-xs rounded p-2 leading-relaxed", m.role === "user" ? "ml-4" : "mr-4")}
                   style={{ background: m.role === "user" ? "#252526" : "#1a2a1a" }}>
                   <span className={cn("text-[10px] font-bold block mb-1", m.role === "user" ? "text-blue-400" : "text-green-400")}>
                     {m.role === "user" ? "You" : `● ${AI_PROVIDER_LABELS[aiProvider]}`}
                   </span>
-                  <pre className="whitespace-pre-wrap font-mono text-[11px]">{m.text || <Loader2 className="h-3 w-3 animate-spin inline" />}</pre>
+                  {m.text
+                    ? (
+                      <pre className="whitespace-pre-wrap font-mono text-[11px]">
+                        {m.text}{isStreaming && <span className="animate-pulse">▌</span>}
+                      </pre>
+                    ) : isStreaming ? (
+                      <div className="flex items-center gap-2 text-[11px] text-[#8fb98f]">
+                        <Loader2 className="h-3 w-3 animate-spin shrink-0" />
+                        <span>Working locally on CPU… {genElapsed}s</span>
+                      </div>
+                    ) : (
+                      <pre className="whitespace-pre-wrap font-mono text-[11px]"><Loader2 className="h-3 w-3 animate-spin inline" /></pre>
+                    )}
                   {m.role === "assistant" && active && extractCode(m.text) && (
                     <div className="flex flex-wrap gap-1 mt-1.5 pt-1.5 border-t" style={{ borderColor: "#2a3a2a" }}>
                       <button
-                        onClick={() => insertIntoEditor(extractCode(m.text)!)}
+                        onClick={() => applySmart(extractCode(m.text)!)}
                         className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-white"
                         style={{ background: "#0e639c" }}
-                        title={`Insert code at cursor in ${active.path.split("/").pop()}`}>
-                        <FilePlus className="h-3 w-3" /> Insert into editor
+                        title={`Find the matching line/function in ${active.path.split("/").pop()} and replace it in place`}>
+                        <FilePlus className="h-3 w-3" /> Apply change
+                      </button>
+                      <button
+                        onClick={() => insertIntoEditor(extractCode(m.text)!)}
+                        className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-[#d4d4d4] hover:text-white"
+                        style={{ background: "#3c3c3c" }}
+                        title="Insert at the cursor position instead">
+                        At cursor
                       </button>
                       <button
                         onClick={() => { if (confirm(`Replace the entire contents of ${active.path.split("/").pop()}? Save (Ctrl+S) to write it to disk.`)) replaceEditorContent(extractCode(m.text)!); }}
@@ -2029,7 +2150,8 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
                     </div>
                   )}
                 </div>
-              ))}
+                );
+              })}
               <div ref={chatBottomRef} />
             </div>
 

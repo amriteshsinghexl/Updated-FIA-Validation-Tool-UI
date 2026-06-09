@@ -1440,9 +1440,11 @@ export async function registerRoutes(
     const useModel = model ?? OLLAMA_MODEL;
 
     // ---- Retrieve grounding context from the index ----
+    // Keep this small: on CPU, a big prompt means slow/never-arriving first token.
     let retrieved: RetrievedChunk[] = [];
+    const ragTopK = Number(process.env.OLLAMA_RAG_TOPK ?? 3);
     if (useRag && indexStatus().exists) {
-      try { retrieved = await retrieve(message, 5); } catch { /* fall back to no-RAG */ }
+      try { retrieved = await retrieve(message, ragTopK); } catch { /* fall back to no-RAG */ }
     }
 
     const systemPrompt =
@@ -1461,7 +1463,10 @@ export async function registerRoutes(
       parts.push(
         "### CONTEXT — relevant excerpts from this project\n" +
         retrieved
-          .map((c) => `From ${c.source} (lines ${c.startLine}-${c.endLine}):\n\`\`\`\n${c.text}\n\`\`\``)
+          .map((c) => {
+            const txt = c.text.length > 1500 ? c.text.slice(0, 1500) + "\n…" : c.text;
+            return `From ${c.source} (lines ${c.startLine}-${c.endLine}):\n\`\`\`\n${txt}\n\`\`\``;
+          })
           .join("\n\n"),
       );
     }
@@ -1495,8 +1500,8 @@ export async function registerRoutes(
           // between prompts. Cap output and context to keep responses snappy.
           keep_alive: process.env.OLLAMA_KEEP_ALIVE ?? "30m",
           options: {
-            num_predict: Number(process.env.OLLAMA_NUM_PREDICT ?? 1024),
-            num_ctx: Number(process.env.OLLAMA_NUM_CTX ?? 8192),
+            num_predict: Number(process.env.OLLAMA_NUM_PREDICT ?? 768),
+            num_ctx: Number(process.env.OLLAMA_NUM_CTX ?? 4096),
             temperature: 0.1,
           },
           messages: [
@@ -1504,7 +1509,7 @@ export async function registerRoutes(
             { role: "user", content: userContent },
           ],
         }),
-        signal: AbortSignal.timeout(180000),
+        signal: AbortSignal.timeout(Number(process.env.OLLAMA_TIMEOUT_MS ?? 600000)),
       });
 
       if (!ollamaRes.ok) {

@@ -16,7 +16,11 @@ scripts** (the UL / FIA / VA engines). The model answers grounded in your own co
    `config.py`), so it uses your real column names and assumptions.
 4. Keep **"Use trained knowledge"** ticked so it pulls in the docs (`Model_specifications`,
    `architecture`, the API docs).
-5. Use the **Insert into editor** / **Replace file** buttons on a reply to apply the code.
+5. Apply the code with the buttons on a reply:
+   - **Apply change** — finds the matching line/function in the file and replaces it in place (keeps indentation).
+   - **At cursor** — inserts where the cursor is.
+   - **Replace file** — swaps the whole file.
+   Then **Ctrl+S** to save. No GitHub needed.
 
 A small (3B) CPU model does best with **specific, scoped** asks. Prefer "add a lapse decrement to
 the projection loop in `forward_projection.py`" over "improve the model."

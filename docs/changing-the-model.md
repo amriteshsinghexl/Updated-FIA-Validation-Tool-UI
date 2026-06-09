@@ -31,8 +31,8 @@ ollama list                        # confirm it's installed
 
 **Any model you pull appears in the dropdown automatically** — no code edit needed. The UI
 reads the live installed list from `/api/local-llm/status` and lists every pulled model marked
-**✓ installed**. If the editor was already open, click **refresh** in the Ollama status box (⚙
-panel) to pick up the new model.
+**✓ installed**. If you pulled it while the editor was open, click **refresh models** (next to
+the Model dropdown in the ⚙ panel) to pick it up — no need to reload.
 
 > Embedding models (e.g. `nomic-embed-text`) are filtered out of the chat-model dropdown, since
 > they can't generate chat responses.
