@@ -11,6 +11,8 @@ import {
   X,
   Check,
   Edit2,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
@@ -103,19 +105,20 @@ const SheetTab = ({
 }) => (
   <div
     className={cn(
-      "group flex items-center gap-1 px-3 py-1.5 text-xs font-medium cursor-pointer border-b-2 transition-colors whitespace-nowrap",
+      "group flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium cursor-pointer border-l-2 transition-colors",
       active
-        ? "border-blue-500 text-blue-700 bg-blue-50/60"
+        ? "border-blue-500 text-blue-700 bg-blue-50/80"
         : "border-transparent text-slate-600 hover:text-slate-800 hover:bg-slate-100"
     )}
     onClick={onSelect}
+    title={name}
   >
     <FileSpreadsheet className="h-3.5 w-3.5 flex-shrink-0" />
-    <span>{name}</span>
+    <span className="truncate flex-1">{name}</span>
     {canDelete && (
       <button
         className={cn(
-          "ml-1 p-0.5 rounded transition-opacity text-slate-400 hover:text-red-500",
+          "p-0.5 rounded transition-opacity text-slate-400 hover:text-red-500 flex-shrink-0",
           active ? "opacity-100" : "opacity-0 group-hover:opacity-100"
         )}
         onClick={(e) => { e.stopPropagation(); onDelete(); }}
@@ -182,6 +185,7 @@ const VAAssumptionsView = () => {
   const [editedData, setEditedData] = useState<SheetData | null>(null);
   const [isDirty, setIsDirty] = useState(false);
   const [showAddSheet, setShowAddSheet] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
 
   // Fetch sheet list
   const { data: sheetsData, isLoading: sheetsLoading } = useQuery<{ sheets: string[] }>({
@@ -358,13 +362,26 @@ const VAAssumptionsView = () => {
       {/* ------------------------------------------------------------------ */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-slate-50 flex-shrink-0">
         <div className="flex items-center gap-2">
+          <button
+            className="p-1 rounded text-slate-500 hover:text-slate-800 hover:bg-slate-200 transition-colors"
+            onClick={() => setSidebarOpen((v) => !v)}
+            title={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
+          >
+            {sidebarOpen ? (
+              <PanelLeftClose className="h-4 w-4" />
+            ) : (
+              <PanelLeftOpen className="h-4 w-4" />
+            )}
+          </button>
           <FileSpreadsheet className="h-4 w-4 text-green-600" />
           <span className="text-sm font-semibold text-slate-800">
             VA Assumptions
           </span>
-          <span className="text-[10px] text-slate-400 ml-1">
-            Assumptions_Extracted.xlsx
-          </span>
+          {activeSheet && (
+            <span className="text-[10px] text-slate-400 ml-1">
+              / {activeSheet}
+            </span>
+          )}
           {isDirty && (
             <span className="text-[10px] text-amber-600 font-medium ml-1 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded">
               Unsaved changes
@@ -404,49 +421,81 @@ const VAAssumptionsView = () => {
       </div>
 
       {/* ------------------------------------------------------------------ */}
-      {/* Sheet tabs                                                           */}
+      {/* Body: left sidebar (file + sheets) | table area                      */}
       {/* ------------------------------------------------------------------ */}
-      <div className="flex items-end border-b border-border bg-white overflow-x-auto flex-shrink-0 px-2 pt-1">
-        {sheetsLoading ? (
-          <div className="flex items-center gap-1 px-3 py-1.5 text-xs text-slate-400">
-            <RefreshCw className="h-3 w-3 animate-spin" /> Loading sheets…
+      <div className="flex flex-1 overflow-hidden">
+        {/* -------------------------------------------------------------- */}
+        {/* Left sidebar                                                     */}
+        {/* -------------------------------------------------------------- */}
+        {sidebarOpen && (
+        <aside className="w-60 flex-shrink-0 flex flex-col border-r border-border bg-slate-50/60 overflow-hidden">
+          {/* File name header */}
+          <div className="flex items-center gap-1.5 px-3 py-2 border-b border-border bg-white flex-shrink-0">
+            <FileSpreadsheet className="h-4 w-4 text-green-600 flex-shrink-0" />
+            <span
+              className="text-xs font-semibold text-slate-800 truncate"
+              title="Assumptions_Extracted.xlsx"
+            >
+              Assumptions_Extracted.xlsx
+            </span>
           </div>
-        ) : (
-          sheets.map((name) => (
-            <SheetTab
-              key={name}
-              name={name}
-              active={activeSheet === name}
-              onSelect={() => {
-                if (isDirty && !window.confirm("You have unsaved changes. Switch sheet anyway?")) return;
-                setActiveSheet(name);
-              }}
-              onDelete={() => handleDeleteSheet(name)}
-              canDelete={sheets.length > 1}
-            />
-          ))
+
+          {/* Sheets label */}
+          <div className="flex items-center justify-between px-3 pt-2 pb-1 flex-shrink-0">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+              Sheets {sheets.length > 0 && `(${sheets.length})`}
+            </span>
+          </div>
+
+          {/* Sheet list */}
+          <div className="flex-1 overflow-y-auto">
+            {sheetsLoading ? (
+              <div className="flex items-center gap-1 px-3 py-1.5 text-xs text-slate-400">
+                <RefreshCw className="h-3 w-3 animate-spin" /> Loading sheets…
+              </div>
+            ) : (
+              sheets.map((name) => (
+                <SheetTab
+                  key={name}
+                  name={name}
+                  active={activeSheet === name}
+                  onSelect={() => {
+                    if (isDirty && !window.confirm("You have unsaved changes. Switch sheet anyway?")) return;
+                    setActiveSheet(name);
+                  }}
+                  onDelete={() => handleDeleteSheet(name)}
+                  canDelete={sheets.length > 1}
+                />
+              ))
+            )}
+          </div>
+
+          {/* Add sheet */}
+          <div className="border-t border-border bg-white flex-shrink-0 py-1">
+            {showAddSheet ? (
+              <div className="py-1">
+                <AddSheetBar
+                  onAdd={(name) => addSheetMutation.mutate(name)}
+                  onCancel={() => setShowAddSheet(false)}
+                />
+              </div>
+            ) : (
+              <button
+                className="flex items-center gap-1.5 w-full px-3 py-1.5 text-xs text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition-colors"
+                onClick={() => setShowAddSheet(true)}
+                title="Add new sheet"
+              >
+                <Plus className="h-3.5 w-3.5" /> Add sheet
+              </button>
+            )}
+          </div>
+        </aside>
         )}
 
-        {showAddSheet ? (
-          <AddSheetBar
-            onAdd={(name) => addSheetMutation.mutate(name)}
-            onCancel={() => setShowAddSheet(false)}
-          />
-        ) : (
-          <button
-            className="flex items-center gap-1 px-2 py-1.5 text-xs text-slate-400 hover:text-slate-700 transition-colors"
-            onClick={() => setShowAddSheet(true)}
-            title="Add new sheet"
-          >
-            <Plus className="h-3.5 w-3.5" />
-          </button>
-        )}
-      </div>
-
-      {/* ------------------------------------------------------------------ */}
-      {/* Table area                                                           */}
-      {/* ------------------------------------------------------------------ */}
-      <div className="flex-1 overflow-auto relative">
+        {/* -------------------------------------------------------------- */}
+        {/* Table area                                                       */}
+        {/* -------------------------------------------------------------- */}
+        <div className="flex-1 overflow-auto relative">
         {sheetLoading ? (
           <div className="flex items-center justify-center h-full gap-2 text-slate-400 text-sm">
             <RefreshCw className="h-4 w-4 animate-spin" /> Loading sheet…
@@ -541,6 +590,7 @@ const VAAssumptionsView = () => {
             </div>
           </>
         )}
+        </div>
       </div>
     </div>
   );

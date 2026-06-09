@@ -139,7 +139,7 @@ When `product === "VA"`, ribbon buttons behave differently from UL:
 |---|---|---|
 | Data View | Navigate to `/data` | Open `C:\projects\VA\data\Input_PolicyDataRaw.xlsx` via `POST /api/open-file` |
 | Assumptions | Navigate to `/assumptions` | Navigate to `/va-assumptions` (in-app editor) |
-| Reports → Financial Summary | Navigate to `/financial-summary` | — (replaced) |
+| Reports → Financial Summary | Navigate to `/financial-summary` | Navigate to `/va-financial-summary` (VA results tree viewer) |
 | Reports → Open Results Folder | — | Open `C:\projects\VA\results\` folder via `POST /api/open-file` |
 
 The `openVAFile(filePath)` helper is used for Data View and Results Folder:
@@ -171,7 +171,8 @@ In-browser editor for `C:\projects\VA\data\Assumptions_Extracted.xlsx`.
 
 | Feature | Description |
 |---|---|
-| Sheet tabs | One tab per worksheet; active tab highlighted |
+| Sheet sidebar | Left-hand panel listing the file name (`Assumptions_Extracted.xlsx`) and one row per worksheet; active sheet highlighted with a left-border accent |
+| Collapse sidebar | `PanelLeftClose` / `PanelLeftOpen` button in the header hides/shows the sheet sidebar so the table can use the full width |
 | Inline cell editing | Double-click any header or data cell to edit; Enter or Blur commits |
 | Add Row / Add Column | Buttons at the bottom of the table |
 | Delete row | Hover over a row to reveal the trash icon |
@@ -221,6 +222,7 @@ Open **http://localhost:3000** → select **VA** → configure Run Type → clic
 
 | File | Contents |
 |---|---|
+| `docs/va-financial-summary-view.md` | VA Financial Summary view — file/sheet tree sidebar + results table |
 | `C:\projects\VA\docs\api_reference.md` | Express endpoints for VA runs + `/api/open-file` |
 | `C:\projects\VA\docs\architecture.md` | System diagram, request flow, directory layout |
 | `C:\projects\VA\docs\running.md` | CLI usage, arguments, input/output paths |

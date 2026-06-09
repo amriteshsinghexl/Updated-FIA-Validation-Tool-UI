@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-01  
 **Files changed:** `client/src/pages/DataView.tsx`  
-**Route:** `/data` (reachable via the **Data View** button in the top ribbon)
+**Route:** `/data` (reachable via the top ribbon → **Inputs** popout → **Data View** button)
 
 ---
 

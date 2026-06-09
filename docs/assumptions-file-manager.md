@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-01  
 **Files changed:** `client/src/pages/AssumptionsView.tsx`  
-**Route:** `/assumptions` (reachable via the **Assumptions** button in the top ribbon → Input Views group)
+**Route:** `/assumptions` (reachable via the top ribbon → **Inputs** popout → **Assumptions** button, under the Input Views group)
 
 ---
 

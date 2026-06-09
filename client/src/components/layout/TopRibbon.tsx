@@ -275,69 +275,93 @@ export const TopRibbon = () => {
 
       {/* Run */}
       <NavGroup label="Run">
-        <div className="flex gap-2">
-          <div className="flex flex-col gap-1">
-            <Link href="/inputs">
-              <Button variant="default" size="sm" className="w-full justify-start h-7 text-xs bg-blue-600 hover:bg-blue-700">
-                <Settings className="mr-2 h-3.5 w-3.5" />
-                Run Setup
-              </Button>
-            </Link>
-            <Button variant="outline" size="sm" className="w-full justify-start h-7 text-xs" onClick={handleReset}>
-              Reset
-            </Button>
-          </div>
-          
-          <div className="flex items-center">
-            <Button 
-              variant="default" 
-              className={cn(
-                "h-15 w-15 flex flex-col items-center justify-center text-white shadow-lg transition-all",
-                isProcessing ? "bg-orange-500 hover:bg-orange-600 animate-pulse" : "bg-green-600 hover:bg-green-700"
-              )}
-              onClick={handleRunModel}
-              disabled={isProcessing}
-            >
-              {isProcessing ? (
-                <>
-                  <div className="h-6 w-6 border-2 border-white/30 border-t-white rounded-full animate-spin mb-1" />
-                  <span className="text-[10px] font-bold uppercase">Wait</span>
-                </>
-              ) : (
-                <>
-                  <Play className="h-6 w-6 mb-1" />
-                  <span className="text-[10px] font-bold uppercase">Run</span>
-                </>
-              )}
-            </Button>
-          </div>
-        </div>
+        <Popover>
+          <PopoverTrigger asChild>
+            <button className="no-underline">
+              <div className="flex flex-col items-center justify-center gap-1 px-2 py-1.5 rounded-md text-xs font-medium transition-colors hover:bg-accent hover:text-accent-foreground cursor-pointer min-w-[70px]">
+                <Play className="h-5 w-5" />
+                <span className="whitespace-nowrap flex items-center gap-1">Run <ChevronDown className="h-3 w-3" /></span>
+              </div>
+            </button>
+          </PopoverTrigger>
+          <PopoverContent className="w-auto p-2" align="start">
+            <div className="flex gap-2">
+              <div className="flex flex-col gap-1">
+                <Link href="/inputs">
+                  <Button variant="default" size="sm" className="w-full justify-start h-7 text-xs bg-blue-600 hover:bg-blue-700">
+                    <Settings className="mr-2 h-3.5 w-3.5" />
+                    Run Setup
+                  </Button>
+                </Link>
+                <Button variant="outline" size="sm" className="w-full justify-start h-7 text-xs" onClick={handleReset}>
+                  Reset
+                </Button>
+              </div>
+
+              <div className="flex items-center">
+                <Button
+                  variant="default"
+                  className={cn(
+                    "h-15 w-15 flex flex-col items-center justify-center text-white shadow-lg transition-all",
+                    isProcessing ? "bg-orange-500 hover:bg-orange-600 animate-pulse" : "bg-green-600 hover:bg-green-700"
+                  )}
+                  onClick={handleRunModel}
+                  disabled={isProcessing}
+                >
+                  {isProcessing ? (
+                    <>
+                      <div className="h-6 w-6 border-2 border-white/30 border-t-white rounded-full animate-spin mb-1" />
+                      <span className="text-[10px] font-bold uppercase">Wait</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="h-6 w-6 mb-1" />
+                      <span className="text-[10px] font-bold uppercase">Run</span>
+                    </>
+                  )}
+                </Button>
+              </div>
+            </div>
+          </PopoverContent>
+        </Popover>
       </NavGroup>
 
       {/* Inputs View */}
       <NavGroup label="Input Views">
-        <div className="flex gap-2">
-          {isVA ? (
-            <>
-              <NavButton
-                icon={Database}
-                label="Data View"
-                onClick={() => openVAFile(`${VA_DATA_DIR}\\Input_PolicyDataRaw.xlsx`)}
-              />
-              <NavButton
-                icon={TableIcon}
-                label="Assumptions"
-                active={location === "/va-assumptions"}
-                href="/va-assumptions"
-              />
-            </>
-          ) : (
-            <>
-              <NavButton icon={Database} label="Data View" active={location === "/data"} href="/data" />
-              <NavButton icon={TableIcon} label="Assumptions" active={location === "/assumptions"} href="/assumptions" />
-            </>
-          )}
-        </div>
+        <Popover>
+          <PopoverTrigger asChild>
+            <button className="no-underline">
+              <div className="flex flex-col items-center justify-center gap-1 px-2 py-1.5 rounded-md text-xs font-medium transition-colors hover:bg-accent hover:text-accent-foreground cursor-pointer min-w-[70px]">
+                <Database className="h-5 w-5" />
+                <span className="whitespace-nowrap flex items-center gap-1">Inputs <ChevronDown className="h-3 w-3" /></span>
+              </div>
+            </button>
+          </PopoverTrigger>
+          <PopoverContent className="w-auto p-2" align="start">
+            <div className="flex gap-2">
+              {isVA ? (
+                <>
+                  <NavButton
+                    icon={Database}
+                    label="Data View"
+                    onClick={() => openVAFile(`${VA_DATA_DIR}\\Input_PolicyDataRaw.xlsx`)}
+                  />
+                  <NavButton
+                    icon={TableIcon}
+                    label="Assumptions"
+                    active={location === "/va-assumptions"}
+                    href="/va-assumptions"
+                  />
+                </>
+              ) : (
+                <>
+                  <NavButton icon={Database} label="Data View" active={location === "/data"} href="/data" />
+                  <NavButton icon={TableIcon} label="Assumptions" active={location === "/assumptions"} href="/assumptions" />
+                </>
+              )}
+            </div>
+          </PopoverContent>
+        </Popover>
       </NavGroup>
 
       {/* Results Reports */}
@@ -509,20 +533,32 @@ export const TopRibbon = () => {
 
       {/* Quality Assurance */}
       <NavGroup label="Quality Assurance">
-        <div className="flex gap-2">
-          <NavButton 
-            icon={GitCompare} 
-            label="Compare" 
-            active={location === "/compare"}
-            href="/compare"
-          />
-          <NavButton 
-            icon={CheckCircle2} 
-            label="Automatic Checks" 
-            active={location === "/auto-checks"}
-            href="/auto-checks"
-          />
-        </div>
+        <Popover>
+          <PopoverTrigger asChild>
+            <button className="no-underline">
+              <div className="flex flex-col items-center justify-center gap-1 px-2 py-1.5 rounded-md text-xs font-medium transition-colors hover:bg-accent hover:text-accent-foreground cursor-pointer min-w-[70px]">
+                <CheckCircle2 className="h-5 w-5" />
+                <span className="whitespace-nowrap flex items-center gap-1">Quality <ChevronDown className="h-3 w-3" /></span>
+              </div>
+            </button>
+          </PopoverTrigger>
+          <PopoverContent className="w-auto p-2" align="start">
+            <div className="flex gap-2">
+              <NavButton
+                icon={GitCompare}
+                label="Compare"
+                active={location === "/compare"}
+                href="/compare"
+              />
+              <NavButton
+                icon={CheckCircle2}
+                label="Automatic Checks"
+                active={location === "/auto-checks"}
+                href="/auto-checks"
+              />
+            </div>
+          </PopoverContent>
+        </Popover>
       </NavGroup>
 
       {/* ULP Engine */}
@@ -536,33 +572,43 @@ export const TopRibbon = () => {
         />
       </NavGroup>
 
-      <div className="flex-1" />
-
       {/* Module Explorer */}
       <NavGroup label="Governance" className="border-l border-border pl-4">
-        <div className="flex gap-2">
-          <NavButton 
-            icon={Layers} 
-            label="Module Explorer" 
-            active={location === "/module-explorer"}
-            href="/module-explorer"
-            className="h-12 w-28 bg-indigo-50/50 border-indigo-100 hover:bg-indigo-100/50"
-          />
-          <NavButton 
-            icon={Database} 
-            label="Data Module" 
-            active={location === "/data-module"}
-            href="/data-module"
-            className="h-12 w-28 bg-blue-50/50 border-blue-100 hover:bg-blue-100/50"
-          />
-          <NavButton 
-            icon={TableIcon} 
-            label="Assumption Module" 
-            active={location === "/assumption-module"}
-            href="/assumption-module"
-            className="h-12 w-32 bg-amber-50/50 border-amber-100 hover:bg-amber-100/50"
-          />
-        </div>
+        <Popover>
+          <PopoverTrigger asChild>
+            <button className="no-underline">
+              <div className="flex flex-col items-center justify-center gap-1 px-2 py-1.5 rounded-md text-xs font-medium transition-colors hover:bg-accent hover:text-accent-foreground cursor-pointer min-w-[70px]">
+                <Layers className="h-5 w-5" />
+                <span className="whitespace-nowrap flex items-center gap-1">Governance <ChevronDown className="h-3 w-3" /></span>
+              </div>
+            </button>
+          </PopoverTrigger>
+          <PopoverContent className="w-auto p-2" align="end">
+            <div className="flex gap-2">
+              <NavButton
+                icon={Layers}
+                label="Module Explorer"
+                active={location === "/module-explorer"}
+                href="/module-explorer"
+                className="h-12 w-28 bg-indigo-50/50 border-indigo-100 hover:bg-indigo-100/50"
+              />
+              <NavButton
+                icon={Database}
+                label="Data Module"
+                active={location === "/data-module"}
+                href="/data-module"
+                className="h-12 w-28 bg-blue-50/50 border-blue-100 hover:bg-blue-100/50"
+              />
+              <NavButton
+                icon={TableIcon}
+                label="Assumption Module"
+                active={location === "/assumption-module"}
+                href="/assumption-module"
+                className="h-12 w-32 bg-amber-50/50 border-amber-100 hover:bg-amber-100/50"
+              />
+            </div>
+          </PopoverContent>
+        </Popover>
       </NavGroup>
 
       {/* Developer View */}
