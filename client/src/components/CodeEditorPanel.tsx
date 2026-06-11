@@ -34,6 +34,10 @@ import { cn } from "@/lib/utils";
 // Language + icon helpers
 // ---------------------------------------------------------------------------
 
+// Default Bedrock model — the US cross-region inference profile for Claude
+// Sonnet 4 (the bare `anthropic.claude-sonnet-4-…` id often requires a profile).
+const BEDROCK_DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-20250514-v1:0";
+
 const LANG_MAP: Record<string, string> = {
   ".ts": "typescript", ".tsx": "typescript",
   ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript",
@@ -849,7 +853,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
   const [indexProgress, setIndexProgress] = useState<{ current: number; total: number; phase: string; message?: string } | null>(null);
 
   // ---------- AI provider settings ----------
-  type AIProvider = "copilot" | "openai" | "anthropic" | "azure" | "gemini" | "ollama";
+  type AIProvider = "copilot" | "openai" | "anthropic" | "azure" | "gemini" | "ollama" | "bedrock";
   const [aiProvider, setAiProvider] = useState<AIProvider>(
     () => (localStorage.getItem("ai_provider") as AIProvider) ?? "copilot",
   );
@@ -858,6 +862,8 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
   const [aiApiKey, setAiApiKey] = useState(() => localStorage.getItem("ai_api_key") ?? "");
   const [aiModel, setAiModel] = useState(() => localStorage.getItem("ai_model") ?? "");
   const [aiAzureEndpoint, setAiAzureEndpoint] = useState(() => localStorage.getItem("ai_azure_endpoint") ?? "");
+  // AWS region for Bedrock (the API key is the bearer token, stored in aiApiKey).
+  const [aiBedrockRegion, setAiBedrockRegion] = useState(() => localStorage.getItem("ai_bedrock_region") ?? "us-east-1");
   const [showAiSettings, setShowAiSettings] = useState(false);
   const [aiSettingsSaved, setAiSettingsSaved] = useState(false);
 
@@ -868,6 +874,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
     azure: "Azure OpenAI",
     gemini: "Google Gemini",
     ollama: "Local LLM (Ollama)",
+    bedrock: "AWS Bedrock (Claude)",
   };
 
   const AI_MODELS: Record<AIProvider, { value: string; label: string }[]> = {
@@ -898,6 +905,11 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
       { value: "qwen2.5-coder:7b", label: "Qwen2.5 Coder 7B (smarter, slow on CPU)" },
       { value: "deepseek-coder:6.7b", label: "DeepSeek Coder 6.7B" },
     ],
+    // Bedrock uses a free-text model field (IDs / inference profiles vary by
+    // account + region), so these are suggestions only — see the model input below.
+    bedrock: [
+      { value: BEDROCK_DEFAULT_MODEL, label: "Claude Sonnet 4 (US inference profile)" },
+    ],
   };
 
   function saveAiSettings() {
@@ -905,6 +917,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
     localStorage.setItem("ai_api_key", aiApiKey.trim());
     localStorage.setItem("ai_model", aiModel);
     localStorage.setItem("ai_azure_endpoint", aiAzureEndpoint.trim());
+    localStorage.setItem("ai_bedrock_region", aiBedrockRegion.trim());
     setAiSettingsSaved(true);
     setTimeout(() => { setAiSettingsSaved(false); setShowAiSettings(false); }, 1200);
   }
@@ -1342,6 +1355,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
     const apiKey = localStorage.getItem("ai_api_key") ?? aiApiKey;
     const model = localStorage.getItem("ai_model") ?? aiModel;
     const azureEndpoint = localStorage.getItem("ai_azure_endpoint") ?? aiAzureEndpoint;
+    const bedrockRegion = localStorage.getItem("ai_bedrock_region") ?? aiBedrockRegion;
 
     // For providers without structured attachment support, fold attachments
     // (and the target-file hint) into the message text.
@@ -1409,6 +1423,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
             apiKey,
             model: model || undefined,
             azureEndpoint: azureEndpoint || undefined,
+            region: bedrockRegion || undefined,
           }),
         });
         if (!res.ok) {
@@ -1760,6 +1775,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
                       ["ollama",    "Local LLM ★ free"],
                       ["openai",    "OpenAI"],
                       ["anthropic", "Anthropic"],
+                      ["bedrock",   "AWS Bedrock"],
                       ["gemini",    "Google Gemini"],
                       ["azure",     "Azure OpenAI"],
                     ] as [AIProvider, string][]).map(([p, label]) => (
@@ -1883,7 +1899,8 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
                     <label className="block text-[#969696] mb-1">
                       {aiProvider === "openai" ? "OpenAI API Key" :
                        aiProvider === "anthropic" ? "Anthropic API Key" :
-                       aiProvider === "gemini" ? "Google Gemini API Key" : "Azure API Key"}
+                       aiProvider === "gemini" ? "Google Gemini API Key" :
+                       aiProvider === "bedrock" ? "AWS Bedrock API Key" : "Azure API Key"}
                     </label>
                     <input
                       type="password"
@@ -1891,6 +1908,7 @@ export function CodeEditorPanel({ open, onClose, standalone }: Props) {
                         aiProvider === "openai" ? "sk-..." :
                         aiProvider === "anthropic" ? "sk-ant-..." :
                         aiProvider === "gemini" ? "AIza..." :
+                        aiProvider === "bedrock" ? "Bedrock bearer token (ABSK...)" :
                         "Azure API key"
                       }
                       value={aiApiKey}
