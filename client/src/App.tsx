@@ -12,7 +12,6 @@ import DebugView from "@/pages/DebugView";
 import RollForwardView from "@/pages/RollForwardView";
 import DataView from "@/pages/DataView";
 import AssumptionsView from "@/pages/AssumptionsView";
-import VAAssumptionsView from "@/pages/VAAssumptionsView";
 import CalculationEngineView from "@/pages/CalculationEngineView";
 import CompareView from "@/pages/CompareView";
 import ModuleExplorerView from "@/pages/ModuleExplorerView";
@@ -20,7 +19,6 @@ import DataModuleView from "@/pages/DataModuleView";
 import AssumptionModuleView from "@/pages/AssumptionModuleView";
 import UlpEngineView from "@/pages/UlpEngineView";
 import FinancialSummaryView from "@/pages/FinancialSummaryView";
-import VAFinancialSummaryView from "@/pages/VAFinancialSummaryView";
 import CodeEditorView from "@/pages/CodeEditorView";
 
 function Router() {
@@ -40,9 +38,7 @@ function Router() {
       <Route path="/assumption-module" component={AssumptionModuleView} />
       <Route path="/data" component={DataView} />
       <Route path="/assumptions" component={AssumptionsView} />
-      <Route path="/va-assumptions" component={VAAssumptionsView} />
       <Route path="/financial-summary" component={FinancialSummaryView} />
-      <Route path="/va-financial-summary" component={VAFinancialSummaryView} />
       <Route component={NotFound} />
     </Switch>
   );

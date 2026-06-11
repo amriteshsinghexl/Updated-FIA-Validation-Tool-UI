@@ -143,14 +143,10 @@ const NavButton = ({
   );
 };
 
-const VA_DATA_DIR = "C:\\projects\\VA\\data";
-const VA_RESULTS_DIR = "C:\\projects\\VA\\results";
-
-function openVAFile(filePath: string) {
-  fetch("/api/open-file", {
+// Ask the server to open a product's configured data file with the OS default app.
+function openProductData(productId: string) {
+  fetch(`/api/products/${encodeURIComponent(productId)}/open-data`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ filePath }),
   }).catch(console.error);
 }
 
@@ -160,8 +156,8 @@ export const TopRibbon = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [showScriptEditor, setShowScriptEditor] = useState(false);
   const [showCodeEditor, setShowCodeEditor] = useState(false);
-  const { product } = useProduct();
-  const isVA = product === "VA";
+  const { product, config } = useProduct();
+  const dataIsExternal = config?.data.kind === "external";
 
   // Formula Extraction state
   const [formulaEntries, setFormulaEntries] = useState<FormulaEntry[]>([]);
@@ -339,26 +335,16 @@ export const TopRibbon = () => {
           </PopoverTrigger>
           <PopoverContent className="w-auto p-2" align="start">
             <div className="flex gap-2">
-              {isVA ? (
-                <>
-                  <NavButton
-                    icon={Database}
-                    label="Data View"
-                    onClick={() => openVAFile(`${VA_DATA_DIR}\\Input_PolicyDataRaw.xlsx`)}
-                  />
-                  <NavButton
-                    icon={TableIcon}
-                    label="Assumptions"
-                    active={location === "/va-assumptions"}
-                    href="/va-assumptions"
-                  />
-                </>
+              {dataIsExternal ? (
+                <NavButton
+                  icon={Database}
+                  label="Data View"
+                  onClick={() => openProductData(product)}
+                />
               ) : (
-                <>
-                  <NavButton icon={Database} label="Data View" active={location === "/data"} href="/data" />
-                  <NavButton icon={TableIcon} label="Assumptions" active={location === "/assumptions"} href="/assumptions" />
-                </>
+                <NavButton icon={Database} label="Data View" active={location === "/data"} href="/data" />
               )}
+              <NavButton icon={TableIcon} label="Assumptions" active={location === "/assumptions"} href="/assumptions" />
             </div>
           </PopoverContent>
         </Popover>
@@ -373,7 +359,7 @@ export const TopRibbon = () => {
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="w-56">
-            <DropdownMenuItem className="text-xs py-2" onClick={() => setLocation(isVA ? "/va-financial-summary" : "/financial-summary")}>Financial Summary</DropdownMenuItem>
+            <DropdownMenuItem className="text-xs py-2" onClick={() => setLocation("/financial-summary")}>Financial Summary</DropdownMenuItem>
             <DropdownMenuItem className="text-xs py-2">Audit Report</DropdownMenuItem>
             <DropdownMenuItem className="text-xs py-2">Validation Report</DropdownMenuItem>
             <DropdownMenuSeparator />

@@ -9,11 +9,10 @@ import {
   buildIndex, indexStatus, retrieve, invalidateCache,
   EMBED_MODEL, type BuildProgress, type RetrievedChunk,
 } from "./rag";
-
-// Directory that contains product folders (e.g. C:\projects\UL).
-// Override with PRODUCTS_DIR env var; defaults to the parent of this app's root.
-const PRODUCTS_DIR =
-  process.env.PRODUCTS_DIR ?? path.resolve(process.cwd(), "..");
+import {
+  PRODUCTS_DIR, listProducts, getProduct, resolveInProduct,
+  type ProductConfig,
+} from "./products";
 
 // Python executable — override with PYTHON_EXEC env var if needed.
 const PYTHON_EXEC = process.env.PYTHON_EXEC ?? "py";
@@ -52,6 +51,80 @@ function finishJob(job: RunJob, exitCode: number): void {
   job.subscribers.clear();
 }
 
+// Spawn a Python subprocess, stream its stdout/stderr line-by-line into a new
+// job, and return the job id. Used by /api/run for every product.
+function startJob(args: string[], cwd: string): string {
+  const runId = randomUUID();
+  const job: RunJob = {
+    runId,
+    status: "running",
+    exitCode: null,
+    output: [],
+    subscribers: new Set(),
+    startedAt: Date.now(),
+    endedAt: null,
+  };
+  jobs.set(runId, job);
+
+  const proc = spawn(PYTHON_EXEC, args, { cwd, shell: false, env: { ...process.env } });
+
+  let stdoutBuf = "";
+  let stderrBuf = "";
+
+  proc.stdout.on("data", (chunk: Buffer) => {
+    stdoutBuf += chunk.toString();
+    const lines = stdoutBuf.split(/\r?\n/);
+    stdoutBuf = lines.pop() ?? "";
+    for (const line of lines) pushLine(job, line);
+  });
+
+  proc.stderr.on("data", (chunk: Buffer) => {
+    stderrBuf += chunk.toString();
+    const lines = stderrBuf.split(/\r?\n/);
+    stderrBuf = lines.pop() ?? "";
+    for (const line of lines) pushLine(job, `[stderr] ${line}`);
+  });
+
+  proc.on("close", (code) => {
+    if (stdoutBuf) pushLine(job, stdoutBuf);
+    if (stderrBuf) pushLine(job, `[stderr] ${stderrBuf}`);
+    finishJob(job, code ?? 1);
+  });
+
+  proc.on("error", (err) => {
+    pushLine(job, `[error] Failed to start process: ${err.message}`);
+    finishJob(job, 1);
+  });
+
+  return runId;
+}
+
+// Build the argv for a product run from its manifest + the request body.
+function buildRunArgs(
+  cfg: ProductConfig,
+  body: { runType?: string; scenarioId?: unknown; outputDir?: unknown; device?: unknown; mode?: unknown; months?: unknown },
+): string[] {
+  const { run } = cfg;
+  const args: string[] = [resolveInProduct(cfg.id, run.script)];
+
+  if (body.runType === "single" && run.singleFlag && body.scenarioId != null && String(body.scenarioId) !== "") {
+    args.push(run.singleFlag, String(body.scenarioId));
+  }
+  if (run.monthsFlag && body.months != null && String(body.months) !== "") {
+    args.push(run.monthsFlag, String(body.months));
+  }
+  // Always-on args declared in the manifest (paths are relative to the product dir).
+  for (const [flag, value] of run.fixedArgs) {
+    args.push(flag, resolveInProduct(cfg.id, value));
+  }
+  // Optional args supplied by the request body, only if the manifest names a flag.
+  if (run.outputFlag && body.outputDir) args.push(run.outputFlag, String(body.outputDir));
+  if (run.deviceFlag && body.device) args.push(run.deviceFlag, String(body.device));
+  if (run.modeFlag && body.mode) args.push(run.modeFlag, String(body.mode));
+
+  return args;
+}
+
 // Clean up completed jobs older than 1 hour.
 setInterval(() => {
   const cutoff = Date.now() - 3_600_000;
@@ -61,35 +134,6 @@ setInterval(() => {
     }
   });
 }, 600_000);
-
-// ---------------------------------------------------------------------------
-// Policy data directory
-// ---------------------------------------------------------------------------
-
-const POLICY_DATA_DIR =
-  process.env.POLICY_DATA_DIR ?? path.join(PRODUCTS_DIR, "UL", "policy_data");
-
-// ---------------------------------------------------------------------------
-// Assumption parameter tables directory
-// ---------------------------------------------------------------------------
-
-const PARAM_TABLES_DIR =
-  process.env.PARAM_TABLES_DIR ?? path.join(PRODUCTS_DIR, "UL", "param_tables");
-
-// ---------------------------------------------------------------------------
-// Results directory (UL model output)
-// ---------------------------------------------------------------------------
-
-const RESULTS_DIR =
-  process.env.RESULTS_DIR ?? path.join(PRODUCTS_DIR, "UL", "results", "test_1");
-
-// ---------------------------------------------------------------------------
-// VA assumptions file
-// ---------------------------------------------------------------------------
-
-const VA_DATA_DIR =
-  process.env.VA_DATA_DIR ?? path.join(PRODUCTS_DIR, "VA", "data");
-const VA_ASSUMPTIONS_FILE = path.join(VA_DATA_DIR, "Assumptions_Extracted.xlsx");
 
 function parseCSV(content: string): { headers: string[]; rows: string[][] } {
   const lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim().split("\n");
@@ -117,196 +161,58 @@ export async function registerRoutes(
 
   // ------------------------------------------------------------------
   // GET /api/products
-  // Returns folder names inside PRODUCTS_DIR as the product list.
-  // Adding a new product folder automatically makes it appear in the UI.
+  // Returns the normalized manifest for every product folder in PRODUCTS_DIR.
+  // Adding a new product folder (+ optional fia.config.json) makes it appear
+  // in the UI and become runnable with no code changes.
   // ------------------------------------------------------------------
   app.get("/api/products", (_req, res) => {
     try {
-      const entries = fs.readdirSync(PRODUCTS_DIR, { withFileTypes: true });
-      const products = entries
-        .filter(
-          (e) =>
-            e.isDirectory() &&
-            e.name !== path.basename(process.cwd())  // exclude app's own folder
-        )
-        .map((e) => ({ id: e.name, label: e.name }));
-
-      res.json({ products });
+      const configs = listProducts();
+      res.json({
+        // `products` keeps the old { id, label } shape for any older caller;
+        // `configs` carries the full manifest the UI now drives itself from.
+        products: configs.map((c) => ({ id: c.id, label: c.label })),
+        configs,
+      });
     } catch (err) {
       console.error("Failed to read products directory:", err);
-      res.status(500).json({
-        error: "Could not read products directory",
-        path: PRODUCTS_DIR,
-      });
+      res.status(500).json({ error: "Could not read products directory", path: PRODUCTS_DIR });
     }
   });
 
   // ------------------------------------------------------------------
+  // GET /api/products/:id  — single product manifest
+  // ------------------------------------------------------------------
+  app.get("/api/products/:id", (req, res) => {
+    const cfg = getProduct(req.params.id);
+    if (!cfg) return res.status(404).json({ error: "Product not found" });
+    res.json(cfg);
+  });
+
+  // ------------------------------------------------------------------
   // POST /api/run
-  // Spawns the model script inside the selected product's folder.
-  //   UL  → python run_model.py [--scenario-id N] [--device X] [--mode X]
-  //   VA  → python lincoln_va/run.py [--reserve-basis X] [--reserve-method X]
-  //              [--policy-id X] [--months N]
+  // Spawns the model script inside the selected product's folder, building the
+  // command line entirely from the product's manifest (fia.config.json).
   // Returns { runId } immediately; use /api/run/:runId/stream for output.
   // ------------------------------------------------------------------
   app.post("/api/run", async (req, res) => {
-    const {
-      product,
-      runType,
-      scenarioId,
-      outputDir,
-      device,
-      mode,
-      months,
-    } = req.body;
+    const { product, runType, scenarioId } = req.body;
 
-    if (!product) {
-      return res.status(400).json({ error: "product is required" });
-    }
+    if (!product) return res.status(400).json({ error: "product is required" });
 
-    const productDir = path.join(PRODUCTS_DIR, product);
-    if (!fs.existsSync(productDir)) {
-      return res.status(404).json({ error: `Product directory not found: ${productDir}` });
-    }
+    const cfg = getProduct(product);
+    if (!cfg) return res.status(404).json({ error: `Product not found: ${product}` });
 
-    // ----------------------------------------------------------------
-    // VA product: spawn C:\projects\VA\run.py directly
-    // ----------------------------------------------------------------
-    if (product === "VA") {
-      const vaDir = path.join(PRODUCTS_DIR, "VA");
-      const scriptPath = path.join(vaDir, "run.py");
-
-      if (!fs.existsSync(scriptPath)) {
-        return res.status(404).json({ error: `run.py not found in ${vaDir}` });
-      }
-
-      const vaArgs: string[] = [
-        scriptPath,
-        "--policy-path",    path.join(vaDir, "data", "Input_PolicyDataRaw.xlsx"),
-        "--assumptions-path", path.join(vaDir, "data", "Assumptions_Extracted.xlsx"),
-        "--output-dir",     path.join(vaDir, "results"),
-      ];
-
-      if (months) vaArgs.push("--months", String(months));
-      // runType "single" with a scenarioId → treat scenarioId as policy-id
-      if (runType === "single" && scenarioId) {
-        vaArgs.push("--policy-id", String(scenarioId));
-      }
-
-      const runId = randomUUID();
-      const job: RunJob = {
-        runId,
-        status: "running",
-        exitCode: null,
-        output: [],
-        subscribers: new Set(),
-        startedAt: Date.now(),
-        endedAt: null,
-      };
-      jobs.set(runId, job);
-
-      const vaProc = spawn(PYTHON_EXEC, vaArgs, {
-        cwd: vaDir,
-        shell: false,
-        env: { ...process.env },
-      });
-
-      let vaStdoutBuf = "";
-      let vaStderrBuf = "";
-
-      vaProc.stdout.on("data", (chunk: Buffer) => {
-        vaStdoutBuf += chunk.toString();
-        const lines = vaStdoutBuf.split(/\r?\n/);
-        vaStdoutBuf = lines.pop() ?? "";
-        for (const line of lines) pushLine(job, line);
-      });
-
-      vaProc.stderr.on("data", (chunk: Buffer) => {
-        vaStderrBuf += chunk.toString();
-        const lines = vaStderrBuf.split(/\r?\n/);
-        vaStderrBuf = lines.pop() ?? "";
-        for (const line of lines) pushLine(job, `[stderr] ${line}`);
-      });
-
-      vaProc.on("close", (code) => {
-        if (vaStdoutBuf) pushLine(job, vaStdoutBuf);
-        if (vaStderrBuf) pushLine(job, `[stderr] ${vaStderrBuf}`);
-        finishJob(job, code ?? 1);
-      });
-
-      vaProc.on("error", (err) => {
-        pushLine(job, `[error] Failed to start process: ${err.message}`);
-        finishJob(job, 1);
-      });
-
-      return res.json({ runId });
-    }
-
-    // ----------------------------------------------------------------
-    // All other products (UL, …): spawn run_model.py subprocess
-    // ----------------------------------------------------------------
-    const scriptPath = path.join(productDir, "run_model.py");
+    const scriptPath = resolveInProduct(cfg.id, cfg.run.script);
     if (!fs.existsSync(scriptPath)) {
-      return res.status(404).json({ error: `run_model.py not found in ${productDir}` });
+      return res.status(404).json({ error: `${cfg.run.script} not found in product '${cfg.id}'` });
     }
-    if (runType === "single" && !scenarioId) {
-      return res.status(400).json({ error: "scenarioId is required for single scenario runs" });
+    if (runType === "single" && cfg.run.singleFlag && !scenarioId) {
+      return res.status(400).json({ error: "scenarioId is required for single runs" });
     }
 
-    const args: string[] = ["run_model.py"];
-    if (runType === "single") args.push("--scenario-id", String(scenarioId));
-    if (outputDir) args.push("--output-dir", outputDir);
-    if (device) args.push("--device", device);
-    if (mode) args.push("--mode", mode);
-
-    // Create job
-    const runId = randomUUID();
-    const job: RunJob = {
-      runId,
-      status: "running",
-      exitCode: null,
-      output: [],
-      subscribers: new Set(),
-      startedAt: Date.now(),
-      endedAt: null,
-    };
-    jobs.set(runId, job);
-
-    // Spawn Python process
-    const proc = spawn(PYTHON_EXEC, args, {
-      cwd: productDir,
-      shell: false,
-      env: { ...process.env },
-    });
-
-    let stdoutBuf = "";
-    let stderrBuf = "";
-
-    proc.stdout.on("data", (chunk: Buffer) => {
-      stdoutBuf += chunk.toString();
-      const lines = stdoutBuf.split(/\r?\n/);
-      stdoutBuf = lines.pop() ?? "";
-      for (const line of lines) pushLine(job, line);
-    });
-
-    proc.stderr.on("data", (chunk: Buffer) => {
-      stderrBuf += chunk.toString();
-      const lines = stderrBuf.split(/\r?\n/);
-      stderrBuf = lines.pop() ?? "";
-      for (const line of lines) pushLine(job, `[stderr] ${line}`);
-    });
-
-    proc.on("close", (code) => {
-      if (stdoutBuf) pushLine(job, stdoutBuf);
-      if (stderrBuf) pushLine(job, `[stderr] ${stderrBuf}`);
-      finishJob(job, code ?? 1);
-    });
-
-    proc.on("error", (err) => {
-      pushLine(job, `[error] Failed to start process: ${err.message}`);
-      finishJob(job, 1);
-    });
-
+    const args = buildRunArgs(cfg, req.body);
+    const runId = startJob(args, resolveInProduct(cfg.id, "."));
     res.json({ runId });
   });
 
@@ -363,132 +269,93 @@ export async function registerRoutes(
   });
 
   // ------------------------------------------------------------------
-  // POST /api/calculate (kept for compatibility — now delegates to /api/run)
+  // POST /api/calculate (kept for compatibility — delegates to the manifest)
   // ------------------------------------------------------------------
   app.post("/api/calculate", async (req, res) => {
     const { runType, policyId, product } = req.body;
-    if (!product) {
-      return res.status(400).json({ error: "product is required" });
-    }
+    if (!product) return res.status(400).json({ error: "product is required" });
 
-    const productDir = path.join(PRODUCTS_DIR, product);
-    const scriptPath = path.join(productDir, "run_model.py");
+    const cfg = getProduct(product);
+    if (!cfg) return res.status(404).json({ error: `Product not found: ${product}` });
 
+    const scriptPath = resolveInProduct(cfg.id, cfg.run.script);
     if (!fs.existsSync(scriptPath)) {
-      return res.status(404).json({ error: `run_model.py not found for product '${product}'` });
+      return res.status(404).json({ error: `${cfg.run.script} not found for product '${product}'` });
     }
 
-    const args: string[] = ["run_model.py"];
-    if (runType === "single" && policyId) {
-      args.push("--scenario-id", String(policyId));
-    }
-
-    const runId = randomUUID();
-    const job: RunJob = {
-      runId,
-      status: "running",
-      exitCode: null,
-      output: [],
-      subscribers: new Set(),
-      startedAt: Date.now(),
-      endedAt: null,
-    };
-    jobs.set(runId, job);
-
-    const proc = spawn(PYTHON_EXEC, args, {
-      cwd: productDir,
-      shell: false,
-      env: { ...process.env },
-    });
-
-    proc.stdout.on("data", (chunk: Buffer) => {
-      for (const line of chunk.toString().split(/\r?\n/).filter(Boolean)) {
-        pushLine(job, line);
-      }
-    });
-    proc.stderr.on("data", (chunk: Buffer) => {
-      for (const line of chunk.toString().split(/\r?\n/).filter(Boolean)) {
-        pushLine(job, `[stderr] ${line}`);
-      }
-    });
-    proc.on("close", (code) => finishJob(job, code ?? 1));
-    proc.on("error", (err) => {
-      pushLine(job, `[error] ${err.message}`);
-      finishJob(job, 1);
-    });
-
+    const args = buildRunArgs(cfg, { runType, scenarioId: policyId });
+    const runId = startJob(args, resolveInProduct(cfg.id, "."));
     res.json({ runId, streamUrl: `/api/run/${runId}/stream` });
   });
 
+  // ===================================================================
+  // Generic, product-scoped data / assumptions / results endpoints.
+  // Every path resolves directories from the product's manifest, so a new
+  // product gets working Data / Assumptions / Results views with no new code.
+  // ===================================================================
+
+  // Resolve the product config or send a 404. Returns null when not found.
+  function product(req: any, res: Response): ProductConfig | null {
+    const cfg = getProduct(req.params.id);
+    if (!cfg) { res.status(404).json({ error: "Product not found" }); return null; }
+    return cfg;
+  }
+
   // ------------------------------------------------------------------
-  // GET /api/assumptions/files
-  // Lists all files inside PARAM_TABLES_DIR.
+  // Assumptions — CSV/text parameter tables (kind: "csv-files")
+  //   GET    /api/products/:id/assumptions/files
+  //   GET    /api/products/:id/assumptions/files/:filename
+  //   POST   /api/products/:id/assumptions/files          { filename, content }
+  //   DELETE /api/products/:id/assumptions/files/:filename
   // ------------------------------------------------------------------
-  app.get("/api/assumptions/files", (_req, res) => {
+  app.get("/api/products/:id/assumptions/files", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
+    const dir = cfg.assumptions.dir ? resolveInProduct(cfg.id, cfg.assumptions.dir) : null;
+    if (!dir || !fs.existsSync(dir)) return res.json({ files: [] });
     try {
-      if (!fs.existsSync(PARAM_TABLES_DIR)) {
-        return res.json({ files: [] });
-      }
-      const entries = fs.readdirSync(PARAM_TABLES_DIR, { withFileTypes: true });
-      const files = entries
+      const files = fs.readdirSync(dir, { withFileTypes: true })
         .filter((e) => e.isFile())
         .map((e) => {
-          const stat = fs.statSync(path.join(PARAM_TABLES_DIR, e.name));
+          const stat = fs.statSync(path.join(dir, e.name));
           return { name: e.name, size: stat.size, modified: stat.mtime.toISOString() };
         })
         .sort((a, b) => a.name.localeCompare(b.name));
       res.json({ files });
     } catch (err) {
       console.error("assumptions/files list error:", err);
-      res.status(500).json({ error: "Could not list param_tables directory" });
+      res.status(500).json({ error: "Could not list assumptions directory" });
     }
   });
 
-  // ------------------------------------------------------------------
-  // GET /api/assumptions/files/:filename
-  // Returns parsed CSV (headers + rows) or raw text for other formats.
-  // ------------------------------------------------------------------
-  app.get("/api/assumptions/files/:filename", (req, res) => {
+  app.get("/api/products/:id/assumptions/files/:filename", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
     const { filename } = req.params;
-    if (!isSafeFilename(filename)) {
-      return res.status(400).json({ error: "Invalid filename" });
-    }
-    const filePath = path.join(PARAM_TABLES_DIR, filename);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: "File not found" });
-    }
+    if (!isSafeFilename(filename)) return res.status(400).json({ error: "Invalid filename" });
+    if (!cfg.assumptions.dir) return res.status(404).json({ error: "No assumptions directory" });
+    const filePath = resolveInProduct(cfg.id, path.join(cfg.assumptions.dir, filename));
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
     try {
       const content = fs.readFileSync(filePath, "utf-8");
-      const ext = path.extname(filename).toLowerCase();
-      if (ext === ".csv") {
+      if (path.extname(filename).toLowerCase() === ".csv") {
         res.json({ filename, type: "csv", ...parseCSV(content) });
       } else {
         res.json({ filename, type: "text", content });
       }
-    } catch (err) {
+    } catch {
       res.status(500).json({ error: "Could not read file" });
     }
   });
 
-  // ------------------------------------------------------------------
-  // POST /api/assumptions/files
-  // Body: { filename: string, content: string }
-  // Creates or overwrites a file in PARAM_TABLES_DIR.
-  // ------------------------------------------------------------------
-  app.post("/api/assumptions/files", (req, res) => {
+  app.post("/api/products/:id/assumptions/files", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
     const { filename, content } = req.body as { filename: string; content: string };
-    if (!filename || typeof content !== "string") {
-      return res.status(400).json({ error: "filename and content are required" });
-    }
-    if (!isSafeFilename(filename)) {
-      return res.status(400).json({ error: "Invalid filename" });
-    }
-    const filePath = path.join(PARAM_TABLES_DIR, filename);
+    if (!filename || typeof content !== "string") return res.status(400).json({ error: "filename and content are required" });
+    if (!isSafeFilename(filename)) return res.status(400).json({ error: "Invalid filename" });
+    if (!cfg.assumptions.dir) return res.status(404).json({ error: "No assumptions directory" });
+    const dir = resolveInProduct(cfg.id, cfg.assumptions.dir);
     try {
-      if (!fs.existsSync(PARAM_TABLES_DIR)) {
-        fs.mkdirSync(PARAM_TABLES_DIR, { recursive: true });
-      }
-      fs.writeFileSync(filePath, content, "utf-8");
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, filename), content, "utf-8");
       res.json({ success: true, filename });
     } catch (err) {
       console.error("assumptions/files write error:", err);
@@ -496,348 +363,306 @@ export async function registerRoutes(
     }
   });
 
-  // ------------------------------------------------------------------
-  // DELETE /api/assumptions/files/:filename
-  // Removes a file from PARAM_TABLES_DIR.
-  // ------------------------------------------------------------------
-  app.delete("/api/assumptions/files/:filename", (req, res) => {
+  app.delete("/api/products/:id/assumptions/files/:filename", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
     const { filename } = req.params;
-    if (!isSafeFilename(filename)) {
-      return res.status(400).json({ error: "Invalid filename" });
-    }
-    const filePath = path.join(PARAM_TABLES_DIR, filename);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: "File not found" });
-    }
+    if (!isSafeFilename(filename)) return res.status(400).json({ error: "Invalid filename" });
+    if (!cfg.assumptions.dir) return res.status(404).json({ error: "No assumptions directory" });
+    const filePath = resolveInProduct(cfg.id, path.join(cfg.assumptions.dir, filename));
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
     try {
       fs.unlinkSync(filePath);
       res.json({ success: true });
-    } catch (err) {
+    } catch {
       res.status(500).json({ error: "Could not delete file" });
     }
   });
 
   // ------------------------------------------------------------------
-  // GET /api/policy-data
-  // Lists all files in POLICY_DATA_DIR.
+  // Data — in-app file manager (kind: "list")
+  //   GET    /api/products/:id/data
+  //   GET    /api/products/:id/data/:filename            (download)
+  //   POST   /api/products/:id/data/:filename            (raw upload)
+  //   DELETE /api/products/:id/data/:filename
   // ------------------------------------------------------------------
-  app.get("/api/policy-data", (_req, res) => {
+  app.get("/api/products/:id/data", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
+    const dir = resolveInProduct(cfg.id, cfg.data.dir);
+    if (!fs.existsSync(dir)) return res.json({ files: [], dir });
     try {
-      if (!fs.existsSync(POLICY_DATA_DIR)) {
-        return res.json({ files: [] });
-      }
-      const entries = fs.readdirSync(POLICY_DATA_DIR, { withFileTypes: true });
-      const files = entries
+      const files = fs.readdirSync(dir, { withFileTypes: true })
         .filter((e) => e.isFile())
         .map((e) => {
-          const stat = fs.statSync(path.join(POLICY_DATA_DIR, e.name));
+          const stat = fs.statSync(path.join(dir, e.name));
           return { name: e.name, size: stat.size, modified: stat.mtime.toISOString() };
         })
         .sort((a, b) => a.name.localeCompare(b.name));
-      res.json({ files });
+      res.json({ files, dir });
     } catch (err) {
-      console.error("policy-data list error:", err);
-      res.status(500).json({ error: "Could not list policy_data directory" });
+      console.error("data list error:", err);
+      res.status(500).json({ error: "Could not list data directory" });
     }
   });
 
-  // ------------------------------------------------------------------
-  // GET /api/policy-data/:filename
-  // Downloads a file from POLICY_DATA_DIR.
-  // ------------------------------------------------------------------
-  app.get("/api/policy-data/:filename", (req, res) => {
+  app.get("/api/products/:id/data/:filename", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
     const { filename } = req.params;
-    if (!isSafeFilename(filename)) {
-      return res.status(400).json({ error: "Invalid filename" });
-    }
-    const filePath = path.join(POLICY_DATA_DIR, filename);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: "File not found" });
-    }
+    if (!isSafeFilename(filename)) return res.status(400).json({ error: "Invalid filename" });
+    const filePath = resolveInProduct(cfg.id, path.join(cfg.data.dir, filename));
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
     res.download(filePath, filename);
   });
 
-  // ------------------------------------------------------------------
-  // POST /api/policy-data/upload/:filename
-  // Uploads (creates or replaces) a file in POLICY_DATA_DIR.
-  // Body: raw file bytes (application/octet-stream).
-  // ------------------------------------------------------------------
   app.post(
-    "/api/policy-data/upload/:filename",
+    "/api/products/:id/data/:filename",
     express.raw({ type: "*/*", limit: "500mb" }),
     (req, res) => {
+      const cfg = product(req, res); if (!cfg) return;
       const { filename } = req.params;
-      if (!isSafeFilename(filename)) {
-        return res.status(400).json({ error: "Invalid filename" });
-      }
-      const filePath = path.join(POLICY_DATA_DIR, filename);
+      if (!isSafeFilename(filename)) return res.status(400).json({ error: "Invalid filename" });
+      const dir = resolveInProduct(cfg.id, cfg.data.dir);
       try {
-        if (!fs.existsSync(POLICY_DATA_DIR)) {
-          fs.mkdirSync(POLICY_DATA_DIR, { recursive: true });
-        }
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const filePath = path.join(dir, filename);
         fs.writeFileSync(filePath, req.body as Buffer);
-        const stat = fs.statSync(filePath);
-        res.json({ success: true, filename, size: stat.size });
+        res.json({ success: true, filename, size: fs.statSync(filePath).size });
       } catch (err) {
-        console.error("policy-data upload error:", err);
+        console.error("data upload error:", err);
         res.status(500).json({ error: "Could not write file" });
       }
     }
   );
 
-  // ------------------------------------------------------------------
-  // DELETE /api/policy-data/:filename
-  // Removes a file from POLICY_DATA_DIR.
-  // ------------------------------------------------------------------
-  app.delete("/api/policy-data/:filename", (req, res) => {
+  app.delete("/api/products/:id/data/:filename", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
     const { filename } = req.params;
-    if (!isSafeFilename(filename)) {
-      return res.status(400).json({ error: "Invalid filename" });
-    }
-    const filePath = path.join(POLICY_DATA_DIR, filename);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ error: "File not found" });
-    }
+    if (!isSafeFilename(filename)) return res.status(400).json({ error: "Invalid filename" });
+    const filePath = resolveInProduct(cfg.id, path.join(cfg.data.dir, filename));
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
     try {
       fs.unlinkSync(filePath);
       res.json({ success: true });
-    } catch (err) {
+    } catch {
       res.status(500).json({ error: "Could not delete file" });
     }
   });
 
   // ------------------------------------------------------------------
-  // GET /api/results/financial-summary
-  // Returns parsed CSV data from UL/results/test_1.
+  // Open the product's data file or results folder with the OS default app.
+  //   POST /api/products/:id/open-data
+  //   POST /api/products/:id/open-results
   // ------------------------------------------------------------------
-  app.get("/api/results/financial-summary", (_req, res) => {
+  function osOpen(target: string) {
+    exec(`start "" "${path.normalize(target)}"`, (err: Error | null) => {
+      if (err) console.error("os-open error:", err.message);
+    });
+  }
+  app.post("/api/products/:id/open-data", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
+    const rel = cfg.data.file ?? cfg.data.dir;
+    osOpen(resolveInProduct(cfg.id, rel));
+    res.json({ success: true });
+  });
+  app.post("/api/products/:id/open-results", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
+    osOpen(resolveInProduct(cfg.id, cfg.results.dir));
+    res.json({ success: true });
+  });
+
+  // ------------------------------------------------------------------
+  // Results — CSV financial summary (kind: "csv-summary")
+  //   GET /api/products/:id/results/summary
+  // Reads the two CSVs named in results.files ([metrics, summary]) from
+  // results.dir and returns them parsed.
+  // ------------------------------------------------------------------
+  app.get("/api/products/:id/results/summary", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
     try {
-      const metricsFile = path.join(RESULTS_DIR, "scenario_metrics_summary.csv");
-      const summaryFile = path.join(RESULTS_DIR, "summary_scen1.csv");
+      const [metricsName, summaryName] = cfg.results.files;
       const result: Record<string, unknown> = {};
-
-      if (fs.existsSync(metricsFile)) {
-        result.metrics = parseCSV(fs.readFileSync(metricsFile, "utf-8"));
+      if (metricsName) {
+        const f = resolveInProduct(cfg.id, path.join(cfg.results.dir, metricsName));
+        if (fs.existsSync(f)) result.metrics = parseCSV(fs.readFileSync(f, "utf-8"));
       }
-      if (fs.existsSync(summaryFile)) {
-        result.summary = parseCSV(fs.readFileSync(summaryFile, "utf-8"));
+      if (summaryName) {
+        const f = resolveInProduct(cfg.id, path.join(cfg.results.dir, summaryName));
+        if (fs.existsSync(f)) result.summary = parseCSV(fs.readFileSync(f, "utf-8"));
       }
-
       res.json(result);
     } catch (err) {
-      console.error("results/financial-summary error:", err);
+      console.error("results/summary error:", err);
       res.status(500).json({ error: "Could not read financial summary" });
     }
   });
 
   // ------------------------------------------------------------------
-  // GET /api/va/assumptions/sheets
-  // Lists all sheet names in the VA Assumptions_Extracted.xlsx file.
+  // Assumptions — multi-sheet XLSX workbook (kind: "xlsx-sheets")
+  //   GET    /api/products/:id/assumptions/sheets
+  //   GET    /api/products/:id/assumptions/download
+  //   GET    /api/products/:id/assumptions/sheet/:sheetName
+  //   POST   /api/products/:id/assumptions/sheet/:sheetName  { headers, rows }
+  //   POST   /api/products/:id/assumptions/sheets            { sheetName }
+  //   DELETE /api/products/:id/assumptions/sheet/:sheetName
   // ------------------------------------------------------------------
-  app.get("/api/va/assumptions/sheets", (_req, res) => {
+
+  // Resolve the workbook path from the manifest; 404s if not configured/missing.
+  function assumptionsWorkbook(cfg: ProductConfig, res: Response): string | null {
+    if (!cfg.assumptions.file) { res.status(404).json({ error: "No assumptions workbook configured" }); return null; }
+    const file = resolveInProduct(cfg.id, cfg.assumptions.file);
+    if (!fs.existsSync(file)) { res.status(404).json({ error: "Assumptions file not found", path: file }); return null; }
+    return file;
+  }
+
+  app.get("/api/products/:id/assumptions/sheets", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
+    const file = assumptionsWorkbook(cfg, res); if (!file) return;
     try {
-      if (!fs.existsSync(VA_ASSUMPTIONS_FILE)) {
-        return res.status(404).json({ error: "Assumptions file not found", path: VA_ASSUMPTIONS_FILE });
-      }
-      const wb = XLSX.readFile(VA_ASSUMPTIONS_FILE);
-      res.json({ sheets: wb.SheetNames });
+      res.json({ sheets: XLSX.readFile(file).SheetNames });
     } catch (err) {
-      console.error("va/assumptions/sheets error:", err);
+      console.error("assumptions/sheets error:", err);
       res.status(500).json({ error: "Could not read assumptions file" });
     }
   });
 
-  // ------------------------------------------------------------------
-  // GET /api/va/assumptions/download
-  // Serves Assumptions_Extracted.xlsx as a file download.
-  // ------------------------------------------------------------------
-  app.get("/api/va/assumptions/download", (_req, res) => {
-    if (!fs.existsSync(VA_ASSUMPTIONS_FILE)) {
-      return res.status(404).json({ error: "Assumptions file not found" });
-    }
-    res.download(VA_ASSUMPTIONS_FILE, "Assumptions_Extracted.xlsx");
+  app.get("/api/products/:id/assumptions/download", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
+    const file = assumptionsWorkbook(cfg, res); if (!file) return;
+    res.download(file, path.basename(file));
   });
 
-  // ------------------------------------------------------------------
-  // GET /api/va/assumptions/sheet/:sheetName
-  // Returns headers + rows for one sheet (as 2-D string array).
-  // ------------------------------------------------------------------
-  app.get("/api/va/assumptions/sheet/:sheetName", (req, res) => {
+  app.get("/api/products/:id/assumptions/sheet/:sheetName", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
+    const file = assumptionsWorkbook(cfg, res); if (!file) return;
     const sheetName = decodeURIComponent(req.params.sheetName);
     try {
-      if (!fs.existsSync(VA_ASSUMPTIONS_FILE)) {
-        return res.status(404).json({ error: "Assumptions file not found" });
-      }
-      const wb = XLSX.readFile(VA_ASSUMPTIONS_FILE);
-      const ws = wb.Sheets[sheetName];
-      if (!ws) {
-        return res.status(404).json({ error: "Sheet not found" });
-      }
+      const ws = XLSX.readFile(file).Sheets[sheetName];
+      if (!ws) return res.status(404).json({ error: "Sheet not found" });
       const data = XLSX.utils.sheet_to_json<string[]>(ws, { header: 1, defval: "" });
-      const headers: string[] = (data[0] as string[]) ?? [];
-      const rows: string[][] = (data.slice(1) as string[][]);
-      res.json({ sheetName, headers, rows });
+      res.json({ sheetName, headers: (data[0] as string[]) ?? [], rows: data.slice(1) as string[][] });
     } catch (err) {
-      console.error("va/assumptions/sheet GET error:", err);
+      console.error("assumptions/sheet GET error:", err);
       res.status(500).json({ error: "Could not read sheet" });
     }
   });
 
-  // ------------------------------------------------------------------
-  // POST /api/va/assumptions/sheet/:sheetName
-  // Body: { headers: string[], rows: string[][] }
-  // Saves (overwrites) a sheet in the XLSX file.
-  // ------------------------------------------------------------------
-  app.post("/api/va/assumptions/sheet/:sheetName", (req, res) => {
+  app.post("/api/products/:id/assumptions/sheet/:sheetName", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
+    const file = assumptionsWorkbook(cfg, res); if (!file) return;
     const sheetName = decodeURIComponent(req.params.sheetName);
     const { headers, rows } = req.body as { headers: string[]; rows: string[][] };
-    if (!Array.isArray(headers) || !Array.isArray(rows)) {
-      return res.status(400).json({ error: "headers and rows arrays are required" });
-    }
+    if (!Array.isArray(headers) || !Array.isArray(rows)) return res.status(400).json({ error: "headers and rows arrays are required" });
     try {
-      if (!fs.existsSync(VA_ASSUMPTIONS_FILE)) {
-        return res.status(404).json({ error: "Assumptions file not found" });
-      }
-      const wb = XLSX.readFile(VA_ASSUMPTIONS_FILE);
-      const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
-      wb.Sheets[sheetName] = ws;
-      if (!wb.SheetNames.includes(sheetName)) {
-        wb.SheetNames.push(sheetName);
-      }
-      XLSX.writeFile(wb, VA_ASSUMPTIONS_FILE);
+      const wb = XLSX.readFile(file);
+      wb.Sheets[sheetName] = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+      if (!wb.SheetNames.includes(sheetName)) wb.SheetNames.push(sheetName);
+      XLSX.writeFile(wb, file);
       res.json({ success: true, sheetName });
     } catch (err) {
-      console.error("va/assumptions/sheet POST error:", err);
+      console.error("assumptions/sheet POST error:", err);
       res.status(500).json({ error: "Could not save sheet" });
     }
   });
 
-  // ------------------------------------------------------------------
-  // POST /api/va/assumptions/sheets
-  // Body: { sheetName: string }
-  // Adds a new empty sheet to the XLSX file.
-  // ------------------------------------------------------------------
-  app.post("/api/va/assumptions/sheets", (req, res) => {
+  app.post("/api/products/:id/assumptions/sheets", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
+    const file = assumptionsWorkbook(cfg, res); if (!file) return;
     const { sheetName } = req.body as { sheetName?: string };
-    if (!sheetName || typeof sheetName !== "string" || !sheetName.trim()) {
-      return res.status(400).json({ error: "sheetName is required" });
-    }
+    if (!sheetName || typeof sheetName !== "string" || !sheetName.trim()) return res.status(400).json({ error: "sheetName is required" });
     const name = sheetName.trim();
     try {
-      if (!fs.existsSync(VA_ASSUMPTIONS_FILE)) {
-        return res.status(404).json({ error: "Assumptions file not found" });
-      }
-      const wb = XLSX.readFile(VA_ASSUMPTIONS_FILE);
-      if (wb.SheetNames.includes(name)) {
-        return res.status(409).json({ error: "Sheet already exists" });
-      }
-      const ws = XLSX.utils.aoa_to_sheet([[]]);
-      wb.Sheets[name] = ws;
+      const wb = XLSX.readFile(file);
+      if (wb.SheetNames.includes(name)) return res.status(409).json({ error: "Sheet already exists" });
+      wb.Sheets[name] = XLSX.utils.aoa_to_sheet([[]]);
       wb.SheetNames.push(name);
-      XLSX.writeFile(wb, VA_ASSUMPTIONS_FILE);
+      XLSX.writeFile(wb, file);
       res.json({ success: true, sheetName: name });
     } catch (err) {
-      console.error("va/assumptions/sheets POST error:", err);
+      console.error("assumptions/sheets POST error:", err);
       res.status(500).json({ error: "Could not create sheet" });
     }
   });
 
-  // ------------------------------------------------------------------
-  // DELETE /api/va/assumptions/sheet/:sheetName
-  // Removes a sheet from the XLSX file.
-  // ------------------------------------------------------------------
-  app.delete("/api/va/assumptions/sheet/:sheetName", (req, res) => {
+  app.delete("/api/products/:id/assumptions/sheet/:sheetName", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
+    const file = assumptionsWorkbook(cfg, res); if (!file) return;
     const sheetName = decodeURIComponent(req.params.sheetName);
     try {
-      if (!fs.existsSync(VA_ASSUMPTIONS_FILE)) {
-        return res.status(404).json({ error: "Assumptions file not found" });
-      }
-      const wb = XLSX.readFile(VA_ASSUMPTIONS_FILE);
-      if (!wb.SheetNames.includes(sheetName)) {
-        return res.status(404).json({ error: "Sheet not found" });
-      }
-      if (wb.SheetNames.length === 1) {
-        return res.status(400).json({ error: "Cannot delete the only sheet" });
-      }
+      const wb = XLSX.readFile(file);
+      if (!wb.SheetNames.includes(sheetName)) return res.status(404).json({ error: "Sheet not found" });
+      if (wb.SheetNames.length === 1) return res.status(400).json({ error: "Cannot delete the only sheet" });
       wb.SheetNames = wb.SheetNames.filter((s) => s !== sheetName);
       delete wb.Sheets[sheetName];
-      XLSX.writeFile(wb, VA_ASSUMPTIONS_FILE);
+      XLSX.writeFile(wb, file);
       res.json({ success: true });
     } catch (err) {
-      console.error("va/assumptions/sheet DELETE error:", err);
+      console.error("assumptions/sheet DELETE error:", err);
       res.status(500).json({ error: "Could not delete sheet" });
     }
   });
 
   // ------------------------------------------------------------------
-  // VA Results endpoints
-  // GET /api/va/results          — list .xlsx files in C:\projects\VA\results\
-  // GET /api/va/results/:f/download  — download the xlsx
-  // GET /api/va/results/:f/sheets    — list sheet names
-  // GET /api/va/results/:f/sheet/:s  — return headers + rows for a sheet
+  // Results — multi-file XLSX tree (kind: "xlsx-tree")
+  //   GET /api/products/:id/results                       — list .xlsx files
+  //   GET /api/products/:id/results/:filename/download
+  //   GET /api/products/:id/results/:filename/sheets
+  //   GET /api/products/:id/results/:filename/sheet/:s
   // ------------------------------------------------------------------
-
-  const VA_RESULTS_DIR =
-    process.env.VA_RESULTS_DIR ?? path.join(PRODUCTS_DIR, "VA", "results");
-
-  app.get("/api/va/results", (_req, res) => {
+  app.get("/api/products/:id/results", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
+    const dir = resolveInProduct(cfg.id, cfg.results.dir);
+    if (!fs.existsSync(dir)) return res.json({ files: [] });
     try {
-      if (!fs.existsSync(VA_RESULTS_DIR)) {
-        return res.json({ files: [] });
-      }
-      const entries = fs.readdirSync(VA_RESULTS_DIR, { withFileTypes: true });
-      const files = entries
+      const files = fs.readdirSync(dir, { withFileTypes: true })
         .filter((e) => e.isFile() && /\.(xlsx|xls)$/i.test(e.name))
         .map((e) => {
-          const stat = fs.statSync(path.join(VA_RESULTS_DIR, e.name));
+          const stat = fs.statSync(path.join(dir, e.name));
           return { name: e.name, size: stat.size, modified: stat.mtime.toISOString() };
         })
         .sort((a, b) => b.modified.localeCompare(a.modified));
       res.json({ files });
     } catch (err) {
-      console.error("va/results list error:", err);
-      res.status(500).json({ error: "Could not list VA results directory" });
+      console.error("results list error:", err);
+      res.status(500).json({ error: "Could not list results directory" });
     }
   });
 
-  app.get("/api/va/results/:filename/download", (req, res) => {
+  app.get("/api/products/:id/results/:filename/download", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
     const { filename } = req.params;
     if (!isSafeFilename(filename)) return res.status(400).json({ error: "Invalid filename" });
-    const filePath = path.join(VA_RESULTS_DIR, filename);
+    const filePath = resolveInProduct(cfg.id, path.join(cfg.results.dir, filename));
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
     res.download(filePath, filename);
   });
 
-  app.get("/api/va/results/:filename/sheets", (req, res) => {
+  app.get("/api/products/:id/results/:filename/sheets", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
     const { filename } = req.params;
     if (!isSafeFilename(filename)) return res.status(400).json({ error: "Invalid filename" });
-    const filePath = path.join(VA_RESULTS_DIR, filename);
+    const filePath = resolveInProduct(cfg.id, path.join(cfg.results.dir, filename));
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
     try {
-      const wb = XLSX.readFile(filePath);
-      res.json({ filename, sheets: wb.SheetNames });
+      res.json({ filename, sheets: XLSX.readFile(filePath).SheetNames });
     } catch (err) {
-      console.error("va/results sheets error:", err);
+      console.error("results sheets error:", err);
       res.status(500).json({ error: "Could not read Excel file" });
     }
   });
 
-  app.get("/api/va/results/:filename/sheet/:sheetName", (req, res) => {
+  app.get("/api/products/:id/results/:filename/sheet/:sheetName", (req, res) => {
+    const cfg = product(req, res); if (!cfg) return;
     const { filename, sheetName } = req.params;
     if (!isSafeFilename(filename)) return res.status(400).json({ error: "Invalid filename" });
     const decodedSheet = decodeURIComponent(sheetName);
-    const filePath = path.join(VA_RESULTS_DIR, filename);
+    const filePath = resolveInProduct(cfg.id, path.join(cfg.results.dir, filename));
     if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
     try {
-      const wb = XLSX.readFile(filePath);
-      const ws = wb.Sheets[decodedSheet];
+      const ws = XLSX.readFile(filePath).Sheets[decodedSheet];
       if (!ws) return res.status(404).json({ error: "Sheet not found" });
       const data = XLSX.utils.sheet_to_json<string[]>(ws, { header: 1, defval: "" });
-      const headers: string[] = (data[0] as string[]) ?? [];
-      const rows: string[][] = data.slice(1) as string[][];
-      res.json({ filename, sheetName: decodedSheet, headers, rows });
+      res.json({ filename, sheetName: decodedSheet, headers: (data[0] as string[]) ?? [], rows: data.slice(1) as string[][] });
     } catch (err) {
-      console.error("va/results sheet error:", err);
+      console.error("results sheet error:", err);
       res.status(500).json({ error: "Could not read sheet" });
     }
   });

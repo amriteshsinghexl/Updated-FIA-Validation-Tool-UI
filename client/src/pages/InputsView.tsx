@@ -13,21 +13,22 @@ import { useProduct } from "@/context/ProductContext";
 type RunStatus = "idle" | "running" | "completed" | "failed";
 
 export default function InputsView() {
-  const { product, setProduct } = useProduct();
+  const { product, setProduct, products, config } = useProduct();
 
   const [runType, setRunType] = useState("portfolio");
   const [scenarioId, setScenarioId] = useState("");
   const [valuationDate, setValuationDate] = useState("Q12025");
   const [projectionMonths, setProjectionMonths] = useState("120");
   const [analysisMode, setAnalysisMode] = useState("summary");
-  const [products, setProducts] = useState<{ id: string; label: string }[]>([]);
 
-  const isVA = product === "VA";
+  const ui = config?.ui;
+  const showMonths = ui?.months ?? false;
+  const idLabel = ui?.idLabel ?? "Scenario ID";
 
-  // Set sensible projection-month default when product changes
+  // Reset projection months to the product's default when the product changes
   useEffect(() => {
-    setProjectionMonths(isVA ? "480" : "120");
-  }, [isVA]);
+    if (ui) setProjectionMonths(String(ui.monthsDefault));
+  }, [product]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const [runStatus, setRunStatus] = useState<RunStatus>("idle");
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -41,23 +42,12 @@ export default function InputsView() {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logLines]);
 
-  // Load product list from API
-  useEffect(() => {
-    fetch("/api/products")
-      .then((r) => r.json())
-      .then((data) => {
-        setProducts(data.products ?? []);
-        if (!product && data.products?.length > 0) setProduct(data.products[0].id);
-      })
-      .catch(console.error);
-  }, []);
-
   // Cleanup SSE on unmount
   useEffect(() => () => esRef.current?.close(), []);
 
   const handleRunCalculation = async () => {
     if (runType === "single" && !scenarioId.trim()) {
-      alert(`Please enter a ${isVA ? "Policy ID" : "Scenario ID"}`);
+      alert(`Please enter a ${idLabel}`);
       return;
     }
     if (!product) {
@@ -77,7 +67,7 @@ export default function InputsView() {
         runType,
         scenarioId: runType === "single" ? scenarioId : undefined,
         mode: analysisMode === "debug" ? "per_policy" : "summary",
-        months: isVA ? projectionMonths : undefined,
+        months: showMonths ? projectionMonths : undefined,
       };
 
       const res = await fetch("/api/run", {
@@ -155,9 +145,15 @@ export default function InputsView() {
     return null;
   };
 
-  const terminalLabel = isVA
-    ? `VA/run.py${runType === "single" && scenarioId ? ` --policy-id ${scenarioId}` : ""}${projectionMonths ? ` --months ${projectionMonths}` : ""}`
-    : `${product}/run_model.py${runType === "single" ? ` --scenario-id ${scenarioId}` : ""}`;
+  // Build a representative command line from the active product's manifest.
+  const terminalLabel = (() => {
+    if (!config) return `${product}`;
+    const r = config.run;
+    let s = `${product}/${r.script}`;
+    if (runType === "single" && r.singleFlag && scenarioId) s += ` ${r.singleFlag} ${scenarioId}`;
+    if (showMonths && r.monthsFlag && projectionMonths) s += ` ${r.monthsFlag} ${projectionMonths}`;
+    return s;
+  })();
 
   return (
     <div className="min-h-screen bg-gray-50/50 p-6 animate-in fade-in duration-500">
@@ -195,7 +191,7 @@ export default function InputsView() {
                     </Select>
                   </div>
 
-                  {isVA && (
+                  {showMonths && (
                     <div className="space-y-1.5">
                       <Label className="text-[11px] font-bold uppercase text-gray-500">Projection Months</Label>
                       <div className="flex items-center gap-2">
@@ -223,6 +219,7 @@ export default function InputsView() {
                           <SelectItem key={p.id} value={p.id}>{p.label}</SelectItem>
                         ))}
                       </SelectContent>
+                      {/* products come from the product registry (/api/products) */}
                     </Select>
                   </div>
 
@@ -235,10 +232,10 @@ export default function InputsView() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="portfolio">
-                          {isVA ? "All Policies" : "Portfolio (all scenarios)"}
+                          {ui?.runTypeLabels.portfolio ?? "Portfolio (all scenarios)"}
                         </SelectItem>
                         <SelectItem value="single">
-                          {isVA ? "Single Policy" : "Single Scenario"}
+                          {ui?.runTypeLabels.single ?? "Single Scenario"}
                         </SelectItem>
                       </SelectContent>
                     </Select>
@@ -247,12 +244,12 @@ export default function InputsView() {
                   {runType === "single" && (
                     <div className="space-y-1.5">
                       <Label className="text-[11px] font-bold uppercase text-gray-500">
-                        {isVA ? "Policy ID" : "Scenario ID"}
+                        {idLabel}
                       </Label>
                       <Input
-                        type={isVA ? "text" : "number"}
-                        min={isVA ? undefined : "1"}
-                        placeholder={isVA ? "e.g. 842612365" : "e.g. 1"}
+                        type={ui?.idType ?? "number"}
+                        min={ui?.idType === "text" ? undefined : "1"}
+                        placeholder={ui?.idPlaceholder ?? "e.g. 1"}
                         value={scenarioId}
                         onChange={(e) => setScenarioId(e.target.value)}
                         className="h-10 text-sm"
@@ -282,8 +279,8 @@ export default function InputsView() {
                     <Play className="mr-2 h-4 w-4" />
                     {runStatus === "running"
                       ? "Running…"
-                      : isVA
-                      ? "Run VA Model"
+                      : ui?.runButton
+                      ? ui.runButton
                       : runType === "portfolio"
                       ? "Run Portfolio"
                       : "Run Single Scenario"}
