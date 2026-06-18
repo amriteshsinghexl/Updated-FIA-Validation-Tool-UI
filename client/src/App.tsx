@@ -4,7 +4,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/not-found";
-import { TopRibbon } from "@/components/layout/TopRibbon";
+import { LeftSidebar } from "@/components/layout/LeftSidebar";
 import { ProductProvider } from "@/context/ProductContext";
 import InputsView from "@/pages/InputsView";
 import AutoChecksView from "@/pages/AutoChecksView";
@@ -49,8 +49,8 @@ function App() {
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
         <ProductProvider>
-          <div className="min-h-screen flex flex-col bg-background font-sans antialiased text-foreground">
-            <TopRibbon />
+          <div className="h-screen flex flex-row bg-background font-sans antialiased text-foreground overflow-hidden">
+            <LeftSidebar />
             <div className="flex-1 overflow-auto">
               <Router />
             </div>
